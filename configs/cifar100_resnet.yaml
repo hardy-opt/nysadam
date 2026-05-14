@@ -1,0 +1,57 @@
+# ═══════════════════════════════════════════════════════════════════
+# NysAdam Experiment Configuration: CIFAR-100 with ResNet-18
+# ═══════════════════════════════════════════════════════════════════
+# Author: Hardik Tankaria | Date: May 2026
+# Description: Harder classification task (100 classes). Tests whether
+#   NysAdam's cross-parameter curvature capture helps more when the
+#   problem is higher-dimensional (more classes → richer Hessian).
+# Usage: python -m nysadam.experiments.run_all --config configs/cifar100_resnet.yaml
+# ═══════════════════════════════════════════════════════════════════
+
+experiment_name: cifar100
+seed: 42
+
+dataset: cifar100
+batch_size: 128
+num_workers: 4
+augment: true
+
+model: resnet18
+model_config:
+  num_classes: 100
+
+epochs: 200
+eval_every: 1
+log_every: 50
+scheduler: cosine
+
+optimizers:
+  sgd:
+    lr: 0.1
+    momentum: 0.9
+    weight_decay: 5.0e-4
+
+  adamw:
+    lr: 1.0e-3
+    betas: [0.9, 0.999]
+    weight_decay: 0.05
+
+  sophia:
+    lr: 1.0e-4
+    betas: [0.965, 0.99]
+    weight_decay: 0.05
+    rho: 1.0
+
+  nysadam:
+    lr: 1.0e-3
+    betas: [0.9, 0.999]
+    weight_decay: 0.05
+    nys_rank: 64
+    nys_refresh_interval: 10
+    nys_subsample: 32
+
+  nysadam_light:
+    lr: 1.0e-3
+    betas: [0.9, 0.999]
+    weight_decay: 0.05
+    nys_rank: 32

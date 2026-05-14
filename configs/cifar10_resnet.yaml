@@ -1,0 +1,77 @@
+# ═══════════════════════════════════════════════════════════════════
+# NysAdam Experiment Configuration: CIFAR-10 with ResNet-18
+# ═══════════════════════════════════════════════════════════════════
+# Author: Hardik Tankaria | Date: May 2026
+# Description: Standard deep learning benchmark. Evaluates both
+#   convergence speed (steps to target accuracy) and final
+#   generalization (test accuracy gap).
+# Usage: python -m nysadam.experiments.run_all --config configs/cifar10_resnet.yaml
+# ═══════════════════════════════════════════════════════════════════
+
+experiment_name: cifar10
+seed: 42
+
+# Data
+dataset: cifar10
+batch_size: 128
+num_workers: 4
+augment: true
+
+# Model
+model: resnet18
+model_config:
+  num_classes: 10
+
+# Training
+epochs: 200
+eval_every: 1
+log_every: 50
+scheduler: cosine
+
+# Optimizers to compare
+optimizers:
+  sgd:
+    lr: 0.1
+    momentum: 0.9
+    weight_decay: 5.0e-4
+
+  adamw:
+    lr: 1.0e-3
+    betas: [0.9, 0.999]
+    weight_decay: 0.05
+
+  sophia:
+    lr: 1.0e-4
+    betas: [0.965, 0.99]
+    weight_decay: 0.05
+    rho: 1.0
+    hessian_refresh_interval: 10
+
+  shampoo:
+    lr: 1.0e-3
+    betas: [0.9, 0.999]
+    weight_decay: 0.05
+    precondition_frequency: 100
+    graft_type: adam
+
+  nysadam:
+    lr: 1.0e-3
+    betas: [0.9, 0.999]
+    weight_decay: 0.05
+    nys_rank: 64
+    nys_refresh_interval: 10
+    nys_beta: 0.999
+    clip_threshold: 1.0
+    reg_lambda: 1.0e-4
+    landmark_selection: topk_norm
+    min_dim_for_nystrom: 1024
+    nys_subsample: 32
+
+  nysadam_light:
+    lr: 1.0e-3
+    betas: [0.9, 0.999]
+    weight_decay: 0.05
+    nys_rank: 32
+    grad_buffer_size: 128
+    nys_refresh_interval: 50
+    min_dim_for_nystrom: 4096

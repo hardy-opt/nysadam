@@ -1,0 +1,65 @@
+# ═══════════════════════════════════════════════════════════════════
+# NysAdam Experiment Configuration: PINN for Burgers' Equation
+# ═══════════════════════════════════════════════════════════════════
+# Author: Hardik Tankaria | Date: May 2026
+# Description: Physics-informed neural network with pathological Hessian
+#   spectrum. PINNs have eigenvalue ratios > 10^6 due to PDE residual
+#   terms, making them an ideal test for curvature-aware optimizers.
+# Usage: python -m nysadam.experiments.run_all --config configs/pinn_burgers.yaml
+# ═══════════════════════════════════════════════════════════════════
+
+experiment_name: pinn_burgers
+seed: 42
+
+dataset: burgers
+n_interior: 10000
+n_boundary: 1000
+n_initial: 1000
+nu: 0.003183098861837907   # 0.01/π
+
+model: pinn
+model_config:
+  input_dim: 2
+  output_dim: 1
+  hidden_dims: [64, 64, 64, 64]
+  activation: tanh
+
+epochs: 1000
+eval_every: 50
+log_every: 20
+scheduler: cosine
+
+optimizers:
+  adamw:
+    lr: 1.0e-3
+    betas: [0.9, 0.999]
+    weight_decay: 0.0
+
+  sgd:
+    lr: 0.01
+    momentum: 0.9
+    weight_decay: 0.0
+
+  nysadam:
+    lr: 1.0e-3
+    betas: [0.9, 0.999]
+    weight_decay: 0.0
+    nys_rank: 32
+    nys_refresh_interval: 10
+    nys_beta: 0.999
+    clip_threshold: 1.0
+    min_dim_for_nystrom: 64
+    nys_subsample: 32
+
+  nysadam_light:
+    lr: 1.0e-3
+    betas: [0.9, 0.999]
+    weight_decay: 0.0
+    nys_rank: 16
+    min_dim_for_nystrom: 64
+
+  sophia:
+    lr: 1.0e-4
+    betas: [0.965, 0.99]
+    weight_decay: 0.0
+    rho: 1.0
