@@ -358,15 +358,17 @@ class NysAdam(Optimizer):
                 m = effective_rank
 
                 # ---- Step 3a: Select m landmark gradients ----
-                G_S = self._select_landmarks(psg, m, selection, state)  # [d, m]
+                # NOTE: if B < m, we can only get min(m, B) landmarks
+                G_S = self._select_landmarks(psg, m, selection, state)  # [d, min(m,B)]
+                actual_cols = G_S.shape[1]
 
                 # ---- Step 3b: Update running sketch via EMA ----
-                Q_old = state["nys_Q"]  # [d, m]
+                Q_old = state["nys_Q"]  # [d, m_actual]
                 scale_new = math.sqrt(1 - nys_beta) / math.sqrt(B)
 
                 if state.get("nys_initialized", False):
                     scale_old = math.sqrt(nys_beta)
-                    # Concatenate: [d, 2m]
+                    # Concatenate: [d, Q_old_cols + actual_cols]
                     Q_combined = torch.cat(
                         [scale_old * Q_old, scale_new * G_S], dim=1
                     )
@@ -375,12 +377,17 @@ class NysAdam(Optimizer):
                     state["nys_initialized"] = True
 
                 # Truncated SVD to keep top-m singular vectors
-                state["nys_Q"] = self._truncated_svd(Q_combined, m)
+                # Target rank is min(m, available columns) to avoid requesting
+                # more components than exist
+                target_rank = min(m, Q_combined.shape[1])
+                state["nys_Q"] = self._truncated_svd(Q_combined, target_rank)
 
                 # ---- Step 3c: Compute core matrix ----
-                Q = state["nys_Q"]  # [d, m]
+                # CRITICAL: use Q's ACTUAL column count, not the configured rank
+                Q = state["nys_Q"]  # [d, actual_rank]
+                actual_rank = Q.shape[1]
                 state["nys_Phi"] = Q.t() @ Q + reg_lambda * torch.eye(
-                    m, device=Q.device, dtype=Q.dtype
+                    actual_rank, device=Q.device, dtype=Q.dtype
                 )
 
     def _select_landmarks(
