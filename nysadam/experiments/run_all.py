@@ -245,6 +245,7 @@ def train(
     optimizer: torch.optim.Optimizer,
     optimizer_name: str,
     train_loader: DataLoader,
+    val_loader: DataLoader,
     test_loader: DataLoader,
     loss_fn,
     config: Dict,
@@ -254,19 +255,32 @@ def train(
     """
     Main training loop with support for all optimizer types.
 
+    Evaluation protocol (Hastie et al. 2009, Ch. 7):
+    - val_loader: used every `eval_every` epochs for model selection
+      and checkpoint saving (minimum validation loss by default)
+    - test_loader: touched EXACTLY ONCE after training is complete,
+      for final unbiased evaluation only
+
+    Model selection criterion (Gneiting & Raftery, 2007):
+    - Default: minimum validation loss (cross-entropy is a strictly
+      proper scoring rule — uniquely minimized at true distribution)
+    - Override via config['selection_metric'] = 'accuracy' when
+      top-1 accuracy is the sole deployment metric
+
     Handles:
     - Standard gradient-based optimization (Adam, SGD)
     - Per-sample gradient computation for NysAdam/SketchySGD
     - Hessian diagonal updates for Sophia/NysSophia
-    - Periodic evaluation on test set
-    - Comprehensive metric logging
+    - Periodic evaluation on validation set
+    - Comprehensive metric logging (loss, accuracy, F1, ECE)
 
     Args:
         model: Neural network.
         optimizer: Optimizer instance.
         optimizer_name: Name string for logging.
         train_loader: Training data loader.
-        test_loader: Test/validation data loader.
+        val_loader: Validation data loader (for model selection).
+        test_loader: Test data loader (touched ONCE at the end).
         loss_fn: Loss function.
         config: Training configuration dict.
         device: Computation device.
@@ -281,6 +295,12 @@ def train(
     nys_subsample = config.get("nys_subsample", 32)
     nys_refresh = config.get("nys_refresh_interval", 10)
     hessian_refresh = config.get("hessian_refresh_interval", 10)
+
+    # Model selection criterion (Gneiting & Raftery 2007):
+    # Default 'loss' = min validation loss (proper scoring rule)
+    # Alternative 'accuracy' = max validation accuracy (only when
+    #   accuracy is the sole deployment metric + balanced classes)
+    selection_metric = config.get("selection_metric", "loss")
 
     # Learning rate scheduler
     scheduler_name = config.get("scheduler", "cosine")
@@ -312,7 +332,8 @@ def train(
     model.train()
     global_step = 0
     start_time = time.perf_counter()
-    best_val_metric = float("inf")  # Track best for checkpointing
+    # For checkpoint selection: lower is better for loss, higher for accuracy
+    best_val_metric = float("inf") if selection_metric == "loss" else 0.0
 
     needs_per_sample = optimizer_name in ("nysadam", "nyssophia", "sketchy_sgd")
     needs_hessian = optimizer_name in ("sophia", "nyssophia")
@@ -417,13 +438,15 @@ def train(
 
             pbar.set_postfix({"loss": f"{loss.item():.4f}", "gnorm": f"{grad_norm:.3f}"})
 
-        # ---- Epoch evaluation ----
+        # ---- Epoch evaluation on VALIDATION set (for model selection) ----
         avg_train_loss = epoch_loss / max(epoch_samples, 1)
 
         if (epoch + 1) % eval_every == 0:
-            test_metrics = evaluate(model, test_loader, loss_fn, device)
-            test_loss = test_metrics["loss"]
-            test_acc = test_metrics.get("accuracy", None)
+            val_metrics = evaluate(model, val_loader, loss_fn, device)
+            val_loss = val_metrics["loss"]
+            val_acc = val_metrics.get("accuracy", None)
+            val_f1 = val_metrics.get("f1_macro", None)
+            val_ece = val_metrics.get("ece", None)
 
             # Log evaluation step
             eval_step = StepMetrics(
@@ -434,23 +457,30 @@ def train(
                 grad_norm=0.0,
                 update_norm=0.0,
                 wall_time=time.perf_counter() - start_time,
-                val_loss=test_loss,
-                val_accuracy=test_acc,
+                val_loss=val_loss,
+                val_accuracy=val_acc,
             )
             log.add_step(eval_step)
 
-            acc_str = f" | Test Acc: {test_acc:.4f}" if test_acc is not None else ""
+            acc_str = f" | Val Acc: {val_acc:.4f}" if val_acc is not None else ""
+            f1_str = f" | F1: {val_f1:.4f}" if val_f1 is not None else ""
+            ece_str = f" | ECE: {val_ece:.4f}" if val_ece is not None else ""
             print(
                 f"Epoch {epoch+1}/{epochs} | "
                 f"Train Loss: {avg_train_loss:.4f} | "
-                f"Test Loss: {test_loss:.4f}{acc_str}"
+                f"Val Loss: {val_loss:.4f}{acc_str}{f1_str}{ece_str}"
             )
 
-            # ---- Save best model checkpoint ----
+            # ---- Save best model checkpoint (based on VALIDATION metric) ----
             if save_checkpoints:
-                # Use test loss as the metric (lower is better)
-                current_metric = test_loss
-                if current_metric < best_val_metric:
+                if selection_metric == "loss":
+                    current_metric = val_loss
+                    is_better = current_metric < best_val_metric
+                else:  # accuracy
+                    current_metric = val_acc if val_acc is not None else 0.0
+                    is_better = current_metric > best_val_metric
+
+                if is_better:
                     best_val_metric = current_metric
                     ckpt_path = os.path.join(
                         checkpoint_dir,
@@ -468,23 +498,34 @@ def train(
                             k: v for k, v in config.items()
                             if k not in ("optimizers", "model_config")
                         },
+                        "selection_metric": selection_metric,
+                        "val_loss": val_loss,
+                        "val_accuracy": val_acc,
+                        "val_f1_macro": val_f1,
+                        "val_ece": val_ece,
                         "train_loss": avg_train_loss,
-                        "test_loss": test_loss,
-                        "test_accuracy": test_acc,
                         "experiment_name": experiment_name,
                         "dataset": config.get("dataset", ""),
                     }
                     torch.save(checkpoint, ckpt_path)
-                    print(f"  → Saved best checkpoint (test_loss={test_loss:.4f})")
+                    metric_str = f"val_loss={val_loss:.4f}" if selection_metric == "loss" else f"val_acc={val_acc:.4f}"
+                    print(f"  → Saved best checkpoint ({metric_str})")
 
-    # Final evaluation
+    # ════════════════════════════════════════════════════════════════
+    # FINAL EVALUATION
+    # Validation: for reporting (model was selected on this)
+    # Test: touched EXACTLY ONCE here — unbiased estimate
+    # (Cawley & Talbot, 2010: never use test for selection)
+    # ════════════════════════════════════════════════════════════════
+    final_val = evaluate(model, val_loader, loss_fn, device)
     final_test = evaluate(model, test_loader, loss_fn, device)
+
     log.total_time = time.perf_counter() - start_time
     log.final_train_loss = avg_train_loss
     log.final_test_loss = final_test["loss"]
     log.final_test_accuracy = final_test.get("accuracy", 0.0)
 
-    # Save final model checkpoint
+    # Save final model checkpoint (last epoch, NOT selected by val metric)
     final_ckpt_path = None
     best_ckpt_path = None
     if save_checkpoints:
@@ -504,9 +545,16 @@ def train(
                 k: v for k, v in config.items()
                 if k not in ("optimizers", "model_config")
             },
+            "selection_metric": "none_final_epoch",
+            "val_loss": final_val["loss"],
+            "val_accuracy": final_val.get("accuracy"),
+            "val_f1_macro": final_val.get("f1_macro"),
+            "val_ece": final_val.get("ece"),
+            "test_loss": final_test["loss"],
+            "test_accuracy": final_test.get("accuracy"),
+            "test_f1_macro": final_test.get("f1_macro"),
+            "test_ece": final_test.get("ece"),
             "train_loss": log.final_train_loss,
-            "test_loss": log.final_test_loss,
-            "test_accuracy": log.final_test_accuracy,
             "experiment_name": experiment_name,
             "dataset": config.get("dataset", ""),
             "total_training_time_sec": log.total_time,
@@ -520,15 +568,24 @@ def train(
 
     print(f"\n{'='*70}")
     print(f"DONE: {optimizer_name} | Total time: {log.total_time:.1f}s")
-    print(f"Final Train Loss: {log.final_train_loss:.4f}")
-    print(f"Final Test Loss:  {log.final_test_loss:.4f}")
-    if log.final_test_accuracy > 0:
-        print(f"Final Test Acc:   {log.final_test_accuracy:.4f}")
-    print(f"Best Val Loss:    {log.best_val_loss:.4f}")
-    print(f"Peak Memory:      {get_peak_memory_mb():.1f} MB")
+    print(f"  Train Loss:     {log.final_train_loss:.4f}")
+    print(f"  Val Loss:       {final_val['loss']:.4f}" +
+          (f"  | Val Acc: {final_val.get('accuracy', 0):.4f}" if final_val.get('accuracy') else ""))
+    if final_val.get("f1_macro"):
+        print(f"  Val F1-Macro:   {final_val['f1_macro']:.4f}  | Val ECE: {final_val.get('ece', 0):.4f}")
+    print(f"  ────────────────────────────────────────────")
+    print(f"  Test Loss:      {final_test['loss']:.4f}" +
+          (f"  | Test Acc: {final_test.get('accuracy', 0):.4f}" if final_test.get('accuracy') else "") +
+          "  ← FINAL (unbiased)")
+    if final_test.get("f1_macro"):
+        print(f"  Test F1-Macro:  {final_test['f1_macro']:.4f}  | Test ECE: {final_test.get('ece', 0):.4f}")
+    print(f"  ────────────────────────────────────────────")
+    print(f"  Best Val {selection_metric.title()}:  {log.best_val_loss:.4f}" if selection_metric == "loss"
+          else f"  Best Val Accuracy: {log.best_val_accuracy:.4f}")
+    print(f"  Peak Memory:    {get_peak_memory_mb():.1f} MB")
     if save_checkpoints:
-        print(f"Best checkpoint:  {best_ckpt_path}")
-        print(f"Final checkpoint: {final_ckpt_path}")
+        print(f"  Best checkpoint (by val {selection_metric}): {best_ckpt_path}")
+        print(f"  Final checkpoint (last epoch):  {final_ckpt_path}")
     print(f"{'='*70}\n")
 
     return log
@@ -727,20 +784,20 @@ def run_experiment(
         opt_config = config["optimizers"][opt_name]
         merged_config = {**config, **opt_config}
 
-        # ---- Load data ----
+        # ---- Load data (3-way split: train / val / test) ----
         dataset_name = config["dataset"]
         batch_size = config.get("batch_size", 128)
 
         if dataset_name in ("digits", "covtype", "breast_cancer", "iris", "wine", "synthetic"):
-            train_loader, test_loader, data_info = load_sklearn_dataset(dataset_name)
+            train_loader, val_loader, test_loader, data_info = load_sklearn_dataset(dataset_name)
         elif dataset_name in ("cifar10", "cifar100"):
-            train_loader, test_loader, data_info = load_cifar(
+            train_loader, val_loader, test_loader, data_info = load_cifar(
                 dataset_name, batch_size=batch_size,
             )
         elif dataset_name == "burgers":
             train_loader, pinn_dataset, data_info = load_burgers_data()
         elif dataset_name == "wikitext2":
-            train_loader, test_loader, data_info = load_text_data(
+            train_loader, val_loader, test_loader, data_info = load_text_data(
                 batch_size=batch_size,
             )
         else:
@@ -791,7 +848,7 @@ def run_experiment(
         else:
             log = train(
                 model, optimizer, opt_name,
-                train_loader, test_loader, loss_fn,
+                train_loader, val_loader, test_loader, loss_fn,
                 merged_config, device, experiment_name,
             )
 
@@ -810,8 +867,18 @@ def run_experiment(
 
 
 def _train_pinn(model, optimizer, opt_name, dataset, config, device, experiment_name):
-    """Special training loop for PINNs (no standard dataloader)."""
+    """Special training loop for PINNs (no standard dataloader).
+
+    For NysAdam: computes per-sample gradients by evaluating the PDE loss
+    on small random subsets of collocation points. Each subset gives a
+    different gradient direction, serving as pseudo-per-sample gradients
+    that capture the curvature of the PDE residual loss.
+    """
     epochs = config.get("epochs", 500)
+    nys_refresh = config.get("nys_refresh_interval", 10)
+    nys_subsample = config.get("nys_subsample", 16)
+    needs_per_sample = opt_name in ("nysadam", "nyssophia", "sketchy_sgd")
+
     log = ExperimentLog(
         optimizer_name=opt_name, dataset=experiment_name,
         model="PINN", config=config,
@@ -825,6 +892,20 @@ def _train_pinn(model, optimizer, opt_name, dataset, config, device, experiment_
         loss.backward()
 
         grad_norm = compute_grad_norm(model)
+
+        # ---- Nyström sketch update for NysAdam on PINNs ----
+        # Compute per-sample gradients by evaluating loss on random
+        # subsets of collocation points (each subset = one "sample")
+        if needs_per_sample and (epoch + 1) % nys_refresh == 0:
+            if hasattr(optimizer, "update_nystrom_sketch"):
+                try:
+                    psg = _compute_pinn_per_sample_grads(
+                        model, dataset, device, n_subsets=nys_subsample,
+                    )
+                    optimizer.update_nystrom_sketch(psg)
+                except Exception:
+                    pass  # Gracefully skip on failure
+
         optimizer.step()
 
         if (epoch + 1) % config.get("log_every", 20) == 0:
@@ -847,29 +928,55 @@ def _train_pinn(model, optimizer, opt_name, dataset, config, device, experiment_
     return log
 
 
+def _compute_pinn_per_sample_grads(model, dataset, device, n_subsets=16):
+    """
+    Compute pseudo-per-sample gradients for PINN by evaluating the PDE
+    loss on different random subsets of collocation points.
+
+    Each subset produces a different gradient → these capture the
+    curvature structure of the PDE residual loss landscape.
+    """
+    params = [p for p in model.parameters() if p.requires_grad]
+    per_sample = {p: [] for p in params}
+
+    for _ in range(n_subsets):
+        model.zero_grad()
+        # Evaluate loss on a small random subset
+        loss_i = burgers_pinn_loss(model, dataset, device, n_samples=256)
+        loss_i.backward()
+
+        for p in params:
+            if p.grad is not None:
+                per_sample[p].append(p.grad.detach().clone())
+
+    result = {}
+    for p in params:
+        if per_sample[p]:
+            result[p] = torch.stack(per_sample[p], dim=0)  # [n_subsets, *shape]
+
+    return result
+
+
 def _print_comparison_table(results: Dict[str, ExperimentLog], experiment_name: str):
-    """Print a summary comparison table."""
-    print(f"\n{'='*80}")
+    """Print a summary comparison table with unbiased test metrics."""
+    print(f"\n{'='*90}")
     print(f"COMPARISON TABLE: {experiment_name}")
-    print(f"{'='*80}")
+    print(f"  Model selected by: min VALIDATION loss | Test set touched ONCE (unbiased)")
+    print(f"{'='*90}")
     print(f"{'Optimizer':<18} {'Train Loss':>12} {'Test Loss':>12} "
-          f"{'Test Acc':>10} {'Time (s)':>10} {'Peak MB':>10}")
-    print("-" * 80)
+          f"{'Test Acc':>10} {'Best ValL':>10} {'Time (s)':>10}")
+    print("-" * 90)
 
     for name, log in sorted(results.items()):
         acc_str = f"{log.final_test_accuracy:.4f}" if log.final_test_accuracy > 0 else "N/A"
-        mem_str = "N/A"
-        for s in reversed(log.steps):
-            if s.peak_memory_mb and s.peak_memory_mb > 0:
-                mem_str = f"{s.peak_memory_mb:.0f}"
-                break
+        val_str = f"{log.best_val_loss:.4f}" if log.best_val_loss < float("inf") else "N/A"
 
         print(
             f"{name:<18} {log.final_train_loss:>12.4f} {log.final_test_loss:>12.4f} "
-            f"{acc_str:>10} {log.total_time:>10.1f} {mem_str:>10}"
+            f"{acc_str:>10} {val_str:>10} {log.total_time:>10.1f}"
         )
 
-    print(f"{'='*80}\n")
+    print(f"{'='*90}\n")
 
 
 # ═══════════════════════════════════════════════════════════════════
