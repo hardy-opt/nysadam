@@ -47,7 +47,10 @@ from nysadam.utils.metrics import (
     ExperimentLog, StepMetrics, Timer, compute_grad_norm,
     evaluate, get_peak_memory_mb,
 )
-from nysadam.utils.reproducibility import set_seed, get_device, count_parameters
+from nysadam.utils.reproducibility import (
+    set_seed, get_device, count_parameters,
+    setup_model_for_device, get_gpu_count, print_gpu_summary,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -138,100 +141,63 @@ def create_optimizer(
 # Per-Sample Gradient Computation
 # ═══════════════════════════════════════════════════════════════════
 
-def compute_per_sample_grads_vmap(
+def compute_nystrom_grads_microbatch(
     model: nn.Module,
     loss_fn,
     inputs: torch.Tensor,
     targets: torch.Tensor,
-    max_samples: int = 32,
+    n_microbatches: int = 8,
 ) -> Dict[nn.Parameter, torch.Tensor]:
     """
-    Compute per-sample gradients using functorch vmap (preferred method).
-    Falls back to sequential computation if vmap is not available.
+    Compute gradient directions for Nystrom sketch via micro-batch splitting.
+
+    Instead of B sequential single-sample backward passes (the vmap path
+    silently falls back to this on models with BatchNorm), split the
+    current batch into K micro-batches and compute one gradient per
+    micro-batch. Each micro-batch gradient captures a different view
+    of the curvature.
+
+    Complexity: K backward passes (typically 8) instead of B (typically
+    32). Provides ~4x speedup with minimal sketch quality loss.
 
     Args:
-        model: Neural network.
+        model: Neural network (use raw model, not DataParallel wrapper).
         loss_fn: Loss function.
         inputs: Input batch [B, ...].
-        targets: Targets [B, ...].
-        max_samples: Max samples for per-sample grads (memory control).
+        targets: Target batch [B, ...].
+        n_microbatches: Number of gradient directions to compute.
 
     Returns:
-        Dictionary mapping parameters to per-sample gradients.
+        Dictionary mapping parameters to gradients [n_microbatches, *shape].
     """
-    B = min(inputs.size(0), max_samples)
-    inputs_sub = inputs[:B]
-    targets_sub = targets[:B]
-
-    try:
-        from torch.func import vmap, grad
-        from functools import partial
-
-        # Functional version of forward + loss
-        params_dict = dict(model.named_parameters())
-        params_list = [p for p in model.parameters() if p.requires_grad]
-
-        def compute_loss_stateless(params_values, buffers, x, y):
-            from torch.func import functional_call
-            params_recon = {}
-            idx = 0
-            for name, p in model.named_parameters():
-                if p.requires_grad:
-                    params_recon[name] = params_values[idx]
-                    idx += 1
-                else:
-                    params_recon[name] = p
-            output = functional_call(model, params_recon, (x.unsqueeze(0),))
-            return loss_fn(output, y.unsqueeze(0))
-
-        buffers = dict(model.named_buffers())
-        params_values = tuple(p for p in model.parameters() if p.requires_grad)
-
-        per_sample_grad_fn = vmap(
-            grad(compute_loss_stateless),
-            in_dims=(None, None, 0, 0),
-        )
-        per_sample_grads_tuple = per_sample_grad_fn(
-            params_values, buffers, inputs_sub, targets_sub,
-        )
-
-        result = {}
-        for p, psg in zip(params_list, per_sample_grads_tuple):
-            result[p] = psg.detach()
-        return result
-
-    except (ImportError, Exception):
-        # Fallback: sequential computation
-        return _compute_per_sample_grads_sequential(
-            model, loss_fn, inputs_sub, targets_sub,
-        )
-
-
-def _compute_per_sample_grads_sequential(
-    model: nn.Module,
-    loss_fn,
-    inputs: torch.Tensor,
-    targets: torch.Tensor,
-) -> Dict[nn.Parameter, torch.Tensor]:
-    """Sequential fallback for per-sample gradient computation."""
     B = inputs.size(0)
-    params = [p for p in model.parameters() if p.requires_grad]
-    per_sample = {p: [] for p in params}
+    K = min(n_microbatches, B)
 
-    for i in range(B):
+    params = [p for p in model.parameters() if p.requires_grad]
+    per_mb_grads = {p: [] for p in params}
+
+    perm = torch.randperm(B, device=inputs.device)
+    chunk_size = B // K
+
+    for k in range(K):
+        start = k * chunk_size
+        end = start + chunk_size if k < K - 1 else B
+        idx = perm[start:end]
+
         model.zero_grad()
-        output = model(inputs[i:i + 1])
-        loss_i = loss_fn(output, targets[i:i + 1])
-        loss_i.backward()
+        with torch.enable_grad():
+            output = model(inputs[idx])
+            loss_k = loss_fn(output, targets[idx])
+            loss_k.backward()
 
         for p in params:
             if p.grad is not None:
-                per_sample[p].append(p.grad.detach().clone())
+                per_mb_grads[p].append(p.grad.detach().clone())
 
     result = {}
     for p in params:
-        if per_sample[p]:
-            result[p] = torch.stack(per_sample[p], dim=0)
+        if per_mb_grads[p]:
+            result[p] = torch.stack(per_mb_grads[p], dim=0)
 
     return result
 
@@ -292,7 +258,8 @@ def train(
     epochs = config.get("epochs", 100)
     eval_every = config.get("eval_every", 1)
     log_every = config.get("log_every", 10)
-    nys_subsample = config.get("nys_subsample", 32)
+    nys_n_microbatches = config.get("nys_n_microbatches",
+                                    config.get("nys_subsample", 8))
     nys_refresh = config.get("nys_refresh_interval", 10)
     hessian_refresh = config.get("hessian_refresh_interval", 10)
 
@@ -340,8 +307,10 @@ def train(
 
     print(f"\n{'='*70}")
     print(f"Training: {experiment_name} | Optimizer: {optimizer_name}")
-    print(f"Model: {model.__class__.__name__} | Params: {count_parameters(model):,}")
-    print(f"Epochs: {epochs} | Device: {device}")
+    raw = model.module if hasattr(model, "module") else model
+    print(f"Model: {raw.__class__.__name__} | Params: {count_parameters(raw):,}")
+    print(f"Epochs: {epochs} | Selection: min val {selection_metric}")
+    print_gpu_summary()
     print(f"{'='*70}\n")
 
     for epoch in range(epochs):
@@ -377,26 +346,31 @@ def train(
 
                 # ---- Optimizer-specific updates ----
 
-                # NysAdam / SketchySGD: per-sample gradient update
+                # NysAdam / SketchySGD: micro-batch gradient update
                 if needs_per_sample and global_step % nys_refresh == 0:
                     try:
-                        psg = compute_per_sample_grads_vmap(
-                            model, loss_fn, inputs, targets,
-                            max_samples=nys_subsample,
+                        # Unwrap DataParallel for per-sample grad computation
+                        # (DataParallel splits batch across GPUs, which breaks
+                        # micro-batch gradient collection)
+                        raw = model.module if hasattr(model, "module") else model
+                        psg = compute_nystrom_grads_microbatch(
+                            raw, loss_fn, inputs, targets,
+                            n_microbatches=nys_n_microbatches,
                         )
                         if hasattr(optimizer, "update_nystrom_sketch"):
                             optimizer.update_nystrom_sketch(psg)
-                    except Exception as e:
+                    except Exception:
                         pass  # Gracefully skip on failure
 
                 # Sophia / NysSophia: Hessian diagonal update
                 if needs_hessian and global_step % hessian_refresh == 0:
                     try:
+                        raw = model.module if hasattr(model, "module") else model
                         if hasattr(optimizer, "update_hessian"):
-                            optimizer.update_hessian(model, loss_fn, inputs, targets)
+                            optimizer.update_hessian(raw, loss_fn, inputs, targets)
                         elif hasattr(optimizer, "update_hessian_diagonal"):
                             optimizer.update_hessian_diagonal(
-                                model, loss_fn, inputs, targets,
+                                raw, loss_fn, inputs, targets,
                             )
                     except Exception:
                         pass
@@ -607,7 +581,7 @@ DEFAULT_EXPERIMENTS = {
             "sgd":         {"lr": 0.01, "momentum": 0.9, "weight_decay": 1e-4},
             "nysadam":     {"lr": 1e-3, "nys_rank": 16, "nys_refresh_interval": 5,
                            "weight_decay": 1e-4, "min_dim_for_nystrom": 32,
-                           "nys_subsample": 32},
+                           "nys_n_microbatches": 8},
             "nysadam_light": {"lr": 1e-3, "nys_rank": 16, "weight_decay": 1e-4,
                              "min_dim_for_nystrom": 32},
             "sketchy_sgd": {"lr": 0.01, "nys_rank": 16, "weight_decay": 1e-4,
@@ -630,7 +604,7 @@ DEFAULT_EXPERIMENTS = {
             "shampoo":     {"lr": 1e-3, "weight_decay": 0.05,
                            "precondition_frequency": 100},
             "nysadam":     {"lr": 1e-3, "nys_rank": 64, "weight_decay": 0.05,
-                           "nys_refresh_interval": 10, "nys_subsample": 32},
+                           "nys_refresh_interval": 20, "nys_n_microbatches": 8},
             "nysadam_light": {"lr": 1e-3, "nys_rank": 32, "weight_decay": 0.05},
         },
     },
@@ -647,7 +621,8 @@ DEFAULT_EXPERIMENTS = {
             "sgd":     {"lr": 0.1, "momentum": 0.9, "weight_decay": 5e-4},
             "sophia":  {"lr": 1e-4, "weight_decay": 0.05, "rho": 1.0,
                        "betas": [0.965, 0.99]},
-            "nysadam": {"lr": 1e-3, "nys_rank": 64, "weight_decay": 0.05},
+            "nysadam": {"lr": 1e-3, "nys_rank": 64, "weight_decay": 0.05,
+                       "nys_refresh_interval": 20, "nys_n_microbatches": 8},
             "nysadam_light": {"lr": 1e-3, "nys_rank": 32, "weight_decay": 0.05},
         },
     },
@@ -661,7 +636,8 @@ DEFAULT_EXPERIMENTS = {
         "optimizers": {
             "adamw":   {"lr": 1e-3, "weight_decay": 0.0},
             "nysadam": {"lr": 1e-3, "nys_rank": 32, "weight_decay": 0.0,
-                       "nys_refresh_interval": 10, "min_dim_for_nystrom": 64},
+                       "nys_refresh_interval": 10, "min_dim_for_nystrom": 64,
+                       "nys_n_microbatches": 8},
             "nysadam_light": {"lr": 1e-3, "nys_rank": 16, "weight_decay": 0.0,
                              "min_dim_for_nystrom": 64},
         },
@@ -679,7 +655,7 @@ DEFAULT_EXPERIMENTS = {
             "adamw":   {"lr": 3e-4, "weight_decay": 0.01},
             "sophia":  {"lr": 1e-4, "weight_decay": 0.01, "rho": 1.0},
             "nysadam": {"lr": 3e-4, "nys_rank": 64, "weight_decay": 0.01,
-                       "nys_refresh_interval": 10},
+                       "nys_refresh_interval": 20, "nys_n_microbatches": 8},
             "nysadam_light": {"lr": 3e-4, "nys_rank": 32, "weight_decay": 0.01},
         },
     },
@@ -820,8 +796,14 @@ def run_experiment(
 
         model = create_model(model_name, **model_kwargs).to(device)
 
-        # ---- Create optimizer ----
+        # ---- Create optimizer (BEFORE DataParallel wrapping) ----
+        # Optimizer must reference the original parameters, not
+        # DataParallel copies. DataParallel wraps model.module but
+        # the optimizer param groups point to the original tensors.
         optimizer = create_optimizer(opt_name, model, merged_config)
+
+        # ---- Wrap model for multi-GPU if available ----
+        model, raw_model = setup_model_for_device(model, device)
 
         # ---- Loss function ----
         if model_name == "transformer_lm":
@@ -876,7 +858,8 @@ def _train_pinn(model, optimizer, opt_name, dataset, config, device, experiment_
     """
     epochs = config.get("epochs", 500)
     nys_refresh = config.get("nys_refresh_interval", 10)
-    nys_subsample = config.get("nys_subsample", 16)
+    nys_n_microbatches = config.get("nys_n_microbatches",
+                                    config.get("nys_subsample", 8))
     needs_per_sample = opt_name in ("nysadam", "nyssophia", "sketchy_sgd")
 
     log = ExperimentLog(
@@ -900,7 +883,7 @@ def _train_pinn(model, optimizer, opt_name, dataset, config, device, experiment_
             if hasattr(optimizer, "update_nystrom_sketch"):
                 try:
                     psg = _compute_pinn_per_sample_grads(
-                        model, dataset, device, n_subsets=nys_subsample,
+                        model, dataset, device, n_subsets=nys_n_microbatches,
                     )
                     optimizer.update_nystrom_sketch(psg)
                 except Exception:
