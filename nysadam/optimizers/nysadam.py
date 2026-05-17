@@ -482,6 +482,82 @@ class NysAdam(Optimizer):
         return Q
 
     @torch.no_grad()
+    def compute_per_sample_grads_microbatch(
+        self,
+        model: torch.nn.Module,
+        loss_fn,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        n_microbatches: int = 8,
+    ) -> Dict[torch.nn.Parameter, torch.Tensor]:
+        """
+        Compute gradient directions via micro-batch splitting.
+
+        Instead of B sequential single-sample backward passes (slow),
+        split the batch into K micro-batches and compute one gradient
+        per micro-batch. Each micro-batch gradient is an unbiased
+        estimate of the full gradient, and their outer products capture
+        the Fisher curvature.
+
+        Complexity: K backward passes instead of B (typically 8 vs 32).
+        Speedup: ~4x over single-sample sequential method.
+
+        Args:
+            model: The neural network model.
+            loss_fn: Loss function.
+            inputs: Input batch [B, ...].
+            targets: Target batch [B, ...].
+            n_microbatches: Number of gradient directions to compute.
+                Each uses B/K samples. More = better sketch quality,
+                fewer = faster (default: 8).
+
+        Returns:
+            Dictionary mapping parameters to micro-batch gradients
+            of shape [n_microbatches, *param_shape].
+        """
+        B = inputs.size(0)
+        K = min(n_microbatches, B)
+
+        # Collect parameters eligible for Nystrom
+        nys_params = []
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state[p]
+                if state.get("nys_effective_rank", 0) > 0 and p.requires_grad:
+                    nys_params.append(p)
+
+        if not nys_params:
+            return {}
+
+        # Shuffle and split into K micro-batches
+        perm = torch.randperm(B, device=inputs.device)
+        chunk_size = B // K
+        per_mb_grads = {p: [] for p in nys_params}
+
+        for k in range(K):
+            start = k * chunk_size
+            end = start + chunk_size if k < K - 1 else B
+            idx = perm[start:end]
+
+            model.zero_grad()
+            with torch.enable_grad():
+                output = model(inputs[idx])
+                loss_k = loss_fn(output, targets[idx])
+                loss_k.backward()
+
+            for p in nys_params:
+                if p.grad is not None:
+                    per_mb_grads[p].append(p.grad.detach().clone())
+
+        result = {}
+        for p in nys_params:
+            if per_mb_grads[p]:
+                result[p] = torch.stack(per_mb_grads[p], dim=0)
+
+        return result
+
+    # Keep the simple method as a fallback for small models / testing
+    @torch.no_grad()
     def compute_per_sample_grads_simple(
         self,
         model: torch.nn.Module,
@@ -492,19 +568,14 @@ class NysAdam(Optimizer):
     ) -> Dict[torch.nn.Parameter, torch.Tensor]:
         """
         Compute per-sample gradients via sequential backward passes.
-        This is a simple (but slower) fallback for when functorch/vmap
-        is not available or practical.
-
-        For production use, prefer torch.func.vmap-based computation.
+        Use compute_per_sample_grads_microbatch for production (faster).
 
         Args:
             model: The neural network model.
-            loss_fn: Loss function (must accept (prediction, target) for
-                single samples and return scalar).
-            inputs: Input batch, shape [B, ...].
-            targets: Target batch, shape [B, ...].
-            subsample: If set, compute per-sample grads for only this many
-                randomly selected samples (default: None = all).
+            loss_fn: Loss function.
+            inputs: Input batch [B, ...].
+            targets: Target batch [B, ...].
+            subsample: Compute for only this many samples.
 
         Returns:
             Dictionary mapping parameters to per-sample gradients [B, *shape].
@@ -517,7 +588,6 @@ class NysAdam(Optimizer):
             targets = targets[indices]
             B = subsample
 
-        # Collect parameters eligible for Nyström
         nys_params = []
         for group in self.param_groups:
             for p in group["params"]:
@@ -528,7 +598,6 @@ class NysAdam(Optimizer):
         if not nys_params:
             return {}
 
-        # Compute per-sample gradients
         per_sample_grads = {p: [] for p in nys_params}
 
         for i in range(B):
@@ -544,7 +613,6 @@ class NysAdam(Optimizer):
                 if p.grad is not None:
                     per_sample_grads[p].append(p.grad.detach().clone())
 
-        # Stack into [B, *shape] tensors
         result = {}
         for p in nys_params:
             if per_sample_grads[p]:
