@@ -292,7 +292,7 @@ def train(
     log = ExperimentLog(
         optimizer_name=optimizer_name,
         dataset=experiment_name,
-        model=model.__class__.__name__,
+        model=(model.module if hasattr(model, "module") else model).__class__.__name__,
         config=config,
     )
 
@@ -301,6 +301,14 @@ def train(
     start_time = time.perf_counter()
     # For checkpoint selection: lower is better for loss, higher for accuracy
     best_val_metric = float("inf") if selection_metric == "loss" else 0.0
+
+    # Unwrap DataParallel for class name and raw model access
+    _raw = model.module if hasattr(model, "module") else model
+    model_class_name = _raw.__class__.__name__
+
+    # Early stopping (Prechelt, 1998)
+    patience = config.get("early_stopping_patience", 20)
+    epochs_without_improvement = 0
 
     needs_per_sample = optimizer_name in ("nysadam", "nyssophia", "sketchy_sgd")
     needs_hessian = optimizer_name in ("sophia", "nyssophia")
@@ -402,11 +410,14 @@ def train(
                     peak_memory_mb=get_peak_memory_mb(),
                 )
 
-                # NysAdam diagnostics
+                # NysAdam diagnostics (safe against cusolver errors)
                 if hasattr(optimizer, "get_nystrom_diagnostics"):
-                    diag = optimizer.get_nystrom_diagnostics()
-                    step_metrics.nys_condition_number = diag.get("avg_condition_number")
-                    step_metrics.nys_effective_rank = diag.get("avg_sketch_rank")
+                    try:
+                        diag = optimizer.get_nystrom_diagnostics()
+                        step_metrics.nys_condition_number = diag.get("avg_condition_number")
+                        step_metrics.nys_effective_rank = diag.get("avg_sketch_rank")
+                    except Exception:
+                        pass
 
                 log.add_step(step_metrics)
 
@@ -456,16 +467,18 @@ def train(
 
                 if is_better:
                     best_val_metric = current_metric
+                    epochs_without_improvement = 0
                     ckpt_path = os.path.join(
                         checkpoint_dir,
                         f"{experiment_name}_{optimizer_name}_best.pt",
                     )
+                    # Save raw model state (without DataParallel prefix)
                     checkpoint = {
                         "epoch": epoch + 1,
                         "global_step": global_step,
-                        "model_state_dict": model.state_dict(),
+                        "model_state_dict": _raw.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
-                        "model_class": model.__class__.__name__,
+                        "model_class": model_class_name,
                         "model_config": config.get("model_config", {}),
                         "optimizer_name": optimizer_name,
                         "optimizer_config": {
@@ -483,7 +496,15 @@ def train(
                     }
                     torch.save(checkpoint, ckpt_path)
                     metric_str = f"val_loss={val_loss:.4f}" if selection_metric == "loss" else f"val_acc={val_acc:.4f}"
-                    print(f"  → Saved best checkpoint ({metric_str})")
+                    print(f"  -> Saved best checkpoint ({metric_str})")
+                else:
+                    epochs_without_improvement += 1
+
+            # ---- Early stopping (Prechelt, 1998) ----
+            if epochs_without_improvement >= patience:
+                print(f"\n  Early stopping at epoch {epoch+1} "
+                      f"(no improvement for {patience} epochs)")
+                break
 
     # ════════════════════════════════════════════════════════════════
     # FINAL EVALUATION
@@ -510,9 +531,9 @@ def train(
         checkpoint = {
             "epoch": epochs,
             "global_step": global_step,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": _raw.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "model_class": model.__class__.__name__,
+            "model_class": model_class_name,
             "model_config": config.get("model_config", {}),
             "optimizer_name": optimizer_name,
             "optimizer_config": {
@@ -576,6 +597,7 @@ DEFAULT_EXPERIMENTS = {
         "epochs": 50,
         "eval_every": 1,
         "log_every": 5,
+        "early_stopping_patience": 15,
         "optimizers": {
             "adamw":       {"lr": 1e-3, "weight_decay": 1e-4},
             "sgd":         {"lr": 0.01, "momentum": 0.9, "weight_decay": 1e-4},
@@ -591,11 +613,12 @@ DEFAULT_EXPERIMENTS = {
     "cifar10": {
         "dataset": "cifar10",
         "model": "resnet18",
-        "epochs": 100,
+        "epochs": 200,
         "batch_size": 128,
         "eval_every": 1,
         "log_every": 50,
         "scheduler": "cosine",
+        "early_stopping_patience": 25,
         "optimizers": {
             "adamw":       {"lr": 1e-3, "weight_decay": 0.05},
             "sgd":         {"lr": 0.1, "momentum": 0.9, "weight_decay": 5e-4},
@@ -603,9 +626,12 @@ DEFAULT_EXPERIMENTS = {
                            "betas": [0.965, 0.99]},
             "shampoo":     {"lr": 1e-3, "weight_decay": 0.05,
                            "precondition_frequency": 100},
-            "nysadam":     {"lr": 1e-3, "nys_rank": 64, "weight_decay": 0.05,
-                           "nys_refresh_interval": 20, "nys_n_microbatches": 8},
-            "nysadam_light": {"lr": 1e-3, "nys_rank": 32, "weight_decay": 0.05},
+            "nysadam":     {"lr": 1e-3, "nys_rank": 32, "weight_decay": 0.05,
+                           "nys_refresh_interval": 50,
+                           "min_dim_for_nystrom": 500000,
+                           "nys_n_microbatches": 8},
+            "nysadam_light": {"lr": 1e-3, "nys_rank": 32, "weight_decay": 0.05,
+                             "min_dim_for_nystrom": 100000},
         },
     },
     "cifar100": {
@@ -616,14 +642,18 @@ DEFAULT_EXPERIMENTS = {
         "eval_every": 1,
         "log_every": 50,
         "scheduler": "cosine",
+        "early_stopping_patience": 25,
         "optimizers": {
             "adamw":   {"lr": 1e-3, "weight_decay": 0.05},
             "sgd":     {"lr": 0.1, "momentum": 0.9, "weight_decay": 5e-4},
             "sophia":  {"lr": 1e-4, "weight_decay": 0.05, "rho": 1.0,
                        "betas": [0.965, 0.99]},
-            "nysadam": {"lr": 1e-3, "nys_rank": 64, "weight_decay": 0.05,
-                       "nys_refresh_interval": 20, "nys_n_microbatches": 8},
-            "nysadam_light": {"lr": 1e-3, "nys_rank": 32, "weight_decay": 0.05},
+            "nysadam": {"lr": 1e-3, "nys_rank": 32, "weight_decay": 0.05,
+                       "nys_refresh_interval": 50,
+                       "min_dim_for_nystrom": 500000,
+                       "nys_n_microbatches": 8},
+            "nysadam_light": {"lr": 1e-3, "nys_rank": 32, "weight_decay": 0.05,
+                             "min_dim_for_nystrom": 100000},
         },
     },
     "pinn_burgers": {
@@ -633,6 +663,7 @@ DEFAULT_EXPERIMENTS = {
         "eval_every": 10,
         "log_every": 20,
         "scheduler": "cosine",
+        "early_stopping_patience": 100,
         "optimizers": {
             "adamw":   {"lr": 1e-3, "weight_decay": 0.0},
             "nysadam": {"lr": 1e-3, "nys_rank": 32, "weight_decay": 0.0,
@@ -645,18 +676,23 @@ DEFAULT_EXPERIMENTS = {
     "transformer_lm": {
         "dataset": "wikitext2",
         "model": "transformer_lm",
-        "model_config": {"d_model": 256, "n_heads": 4, "n_layers": 4},
-        "epochs": 20,
-        "batch_size": 32,
+        "model_config": {"d_model": 256, "n_heads": 4, "n_layers": 4,
+                         "max_seq_len": 128},
+        "epochs": 30,
+        "batch_size": 16,
         "eval_every": 1,
-        "log_every": 50,
+        "log_every": 100,
         "scheduler": "cosine",
+        "early_stopping_patience": 8,
         "optimizers": {
             "adamw":   {"lr": 3e-4, "weight_decay": 0.01},
             "sophia":  {"lr": 1e-4, "weight_decay": 0.01, "rho": 1.0},
-            "nysadam": {"lr": 3e-4, "nys_rank": 64, "weight_decay": 0.01,
-                       "nys_refresh_interval": 20, "nys_n_microbatches": 8},
-            "nysadam_light": {"lr": 3e-4, "nys_rank": 32, "weight_decay": 0.01},
+            "nysadam": {"lr": 3e-4, "nys_rank": 32, "weight_decay": 0.01,
+                       "nys_refresh_interval": 50,
+                       "min_dim_for_nystrom": 100000,
+                       "nys_n_microbatches": 8},
+            "nysadam_light": {"lr": 3e-4, "nys_rank": 32, "weight_decay": 0.01,
+                             "min_dim_for_nystrom": 100000},
         },
     },
 }
@@ -773,8 +809,10 @@ def run_experiment(
         elif dataset_name == "burgers":
             train_loader, pinn_dataset, data_info = load_burgers_data()
         elif dataset_name == "wikitext2":
+            seq_len = config.get("model_config", {}).get("max_seq_len", 128)
             train_loader, val_loader, test_loader, data_info = load_text_data(
                 batch_size=batch_size,
+                seq_len=seq_len,
             )
         else:
             raise ValueError(f"Unknown dataset: {dataset_name}")
