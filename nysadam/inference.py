@@ -54,6 +54,27 @@ def load_checkpoint(checkpoint_path: str, device: Optional[torch.device] = None)
     # Reconstruct model from saved config
     model_class = checkpoint["model_class"]
     model_config = checkpoint.get("model_config", {})
+    state_dict = checkpoint["model_state_dict"]
+
+    # Handle checkpoints saved from DataParallel-wrapped models:
+    # 1. Strip "module." prefix from state dict keys if present
+    # 2. Infer actual model class from state dict structure
+    if any(k.startswith("module.") for k in state_dict.keys()):
+        state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+        checkpoint["model_state_dict"] = state_dict
+
+    if model_class == "DataParallel":
+        # Infer actual class from state dict keys
+        if any("transformer" in k for k in state_dict.keys()):
+            model_class = "TransformerLM"
+        elif any("layer4" in k or "layer3" in k for k in state_dict.keys()):
+            model_class = "ResNet"
+        elif any("network" in k for k in state_dict.keys()):
+            # Could be PINN or MLP - check input dim
+            first_weight = [v for k, v in state_dict.items() if "weight" in k][0]
+            model_class = "PINN" if first_weight.shape[1] == 2 else "MLP"
+        else:
+            model_class = "LogisticRegression"
 
     # Infer model constructor args from checkpoint
     if model_class == "LogisticRegression":
@@ -87,7 +108,7 @@ def load_checkpoint(checkpoint_path: str, device: Optional[torch.device] = None)
     }
     model_name = model_name_map.get(model_class, model_class.lower())
     model = create_model(model_name, **model_config)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
 
@@ -99,6 +120,11 @@ def load_checkpoint(checkpoint_path: str, device: Optional[torch.device] = None)
         "experiment": checkpoint.get("experiment_name", "unknown"),
         "dataset": checkpoint.get("dataset", "unknown"),
         "epoch": checkpoint.get("epoch", -1),
+        "selection_metric": checkpoint.get("selection_metric", "loss"),
+        "val_loss": checkpoint.get("val_loss", None),
+        "val_accuracy": checkpoint.get("val_accuracy", None),
+        "val_f1_macro": checkpoint.get("val_f1_macro", None),
+        "val_ece": checkpoint.get("val_ece", None),
         "test_loss": checkpoint.get("test_loss", None),
         "test_accuracy": checkpoint.get("test_accuracy", None),
         "training_time_sec": checkpoint.get("total_training_time_sec", None),
