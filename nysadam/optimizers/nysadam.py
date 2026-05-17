@@ -357,6 +357,10 @@ class NysAdam(Optimizer):
                 B, d = psg.shape
                 m = effective_rank
 
+                # Guard: skip if gradients contain NaN or Inf
+                if not torch.isfinite(psg).all():
+                    continue
+
                 # ---- Step 3a: Select m landmark gradients ----
                 # NOTE: if B < m, we can only get min(m, B) landmarks
                 G_S = self._select_landmarks(psg, m, selection, state)  # [d, min(m,B)]
@@ -380,7 +384,13 @@ class NysAdam(Optimizer):
                 # Target rank is min(m, available columns) to avoid requesting
                 # more components than exist
                 target_rank = min(m, Q_combined.shape[1])
-                state["nys_Q"] = self._truncated_svd(Q_combined, target_rank)
+                Q_new = self._truncated_svd(Q_combined, target_rank)
+
+                # Guard: if SVD produced NaN, keep the old sketch
+                if torch.isfinite(Q_new).all():
+                    state["nys_Q"] = Q_new
+                else:
+                    continue
 
                 # ---- Step 3c: Compute core matrix ----
                 # CRITICAL: use Q's ACTUAL column count, not the configured rank
@@ -622,15 +632,11 @@ class NysAdam(Optimizer):
 
     def get_nystrom_diagnostics(self) -> Dict[str, float]:
         """
-        Return diagnostic information about the Nyström sketch quality.
-        Useful for monitoring and ablation studies.
+        Return diagnostic information about the Nystrom sketch quality.
+        Safe against NaN values and cusolver errors.
 
         Returns:
-            Dictionary with diagnostic metrics:
-                - 'avg_sketch_rank': Average effective rank of Q across layers
-                - 'avg_condition_number': Average condition number of Φ
-                - 'num_nystrom_layers': Number of layers using Nyström
-                - 'num_adam_layers': Number of layers using pure Adam
+            Dictionary with diagnostic metrics.
         """
         diagnostics = {
             "avg_sketch_rank": 0.0,
@@ -652,18 +658,23 @@ class NysAdam(Optimizer):
                     diagnostics["num_nystrom_layers"] += 1
                     nys_count += 1
 
-                    # Effective rank of Q (number of significant singular values)
-                    Q = state["nys_Q"]
-                    sv = torch.linalg.svdvals(Q)
-                    threshold = sv[0] * 1e-6
-                    eff = (sv > threshold).sum().item()
-                    total_rank += eff
+                    try:
+                        Q = state["nys_Q"]
+                        if not torch.isfinite(Q).all():
+                            continue
 
-                    # Condition number of Phi
-                    Phi = state["nys_Phi"]
-                    eigvals = torch.linalg.eigvalsh(Phi)
-                    cond = (eigvals[-1] / eigvals[0]).item() if eigvals[0] > 0 else float("inf")
-                    total_cond += cond
+                        # Use Phi eigenvalues instead of Q svdvals
+                        # (Phi is m x m, much cheaper and stabler than Q which is d x m)
+                        Phi = state["nys_Phi"]
+                        eigvals = torch.linalg.eigvalsh(Phi)
+                        pos_eigvals = eigvals[eigvals > 1e-10]
+                        total_rank += len(pos_eigvals)
+
+                        if len(pos_eigvals) > 0:
+                            cond = (pos_eigvals[-1] / pos_eigvals[0]).item()
+                            total_cond += cond
+                    except Exception:
+                        continue
                 else:
                     diagnostics["num_adam_layers"] += 1
 
