@@ -357,16 +357,27 @@ def train(
                 # NysAdam / SketchySGD: micro-batch gradient update
                 if needs_per_sample and global_step % nys_refresh == 0:
                     try:
-                        # Unwrap DataParallel for per-sample grad computation
-                        # (DataParallel splits batch across GPUs, which breaks
-                        # micro-batch gradient collection)
                         raw = model.module if hasattr(model, "module") else model
+
+                        # Save the full-batch gradient before microbatch computation.
+                        # compute_nystrom_grads_microbatch calls zero_grad() and
+                        # backward() internally, which would overwrite p.grad.
+                        saved_grads = {
+                            p: p.grad.detach().clone()
+                            for p in raw.parameters()
+                            if p.grad is not None
+                        }
+
                         psg = compute_nystrom_grads_microbatch(
                             raw, loss_fn, inputs, targets,
                             n_microbatches=nys_n_microbatches,
                         )
                         if hasattr(optimizer, "update_nystrom_sketch"):
                             optimizer.update_nystrom_sketch(psg)
+
+                        # Restore the full-batch gradient for optimizer.step()
+                        for p, g in saved_grads.items():
+                            p.grad = g
                     except Exception:
                         pass  # Gracefully skip on failure
 
@@ -374,12 +385,24 @@ def train(
                 if needs_hessian and global_step % hessian_refresh == 0:
                     try:
                         raw = model.module if hasattr(model, "module") else model
+
+                        # Save gradients (Hessian estimation also uses backward)
+                        saved_grads = {
+                            p: p.grad.detach().clone()
+                            for p in raw.parameters()
+                            if p.grad is not None
+                        }
+
                         if hasattr(optimizer, "update_hessian"):
                             optimizer.update_hessian(raw, loss_fn, inputs, targets)
                         elif hasattr(optimizer, "update_hessian_diagonal"):
                             optimizer.update_hessian_diagonal(
                                 raw, loss_fn, inputs, targets,
                             )
+
+                        # Restore gradients
+                        for p, g in saved_grads.items():
+                            p.grad = g
                     except Exception:
                         pass
 
@@ -432,8 +455,11 @@ def train(
             val_acc = val_metrics.get("accuracy", None)
             val_f1 = val_metrics.get("f1_macro", None)
             val_ece = val_metrics.get("ece", None)
+            val_ppl = val_metrics.get("perplexity", None)
+            val_tok_acc = val_metrics.get("token_accuracy", None)
 
-            # Log evaluation step
+            # Log evaluation step (val_accuracy works for both classification
+            # and LM token accuracy)
             eval_step = StepMetrics(
                 step=global_step,
                 epoch=epoch,
@@ -443,17 +469,27 @@ def train(
                 update_norm=0.0,
                 wall_time=time.perf_counter() - start_time,
                 val_loss=val_loss,
-                val_accuracy=val_acc,
+                val_accuracy=val_acc if val_acc is not None else val_tok_acc,
             )
             log.add_step(eval_step)
 
-            acc_str = f" | Val Acc: {val_acc:.4f}" if val_acc is not None else ""
-            f1_str = f" | F1: {val_f1:.4f}" if val_f1 is not None else ""
-            ece_str = f" | ECE: {val_ece:.4f}" if val_ece is not None else ""
+            # Build metric strings for printing
+            if val_acc is not None:
+                extra = f" | Val Acc: {val_acc:.4f}"
+                if val_f1 is not None:
+                    extra += f" | F1: {val_f1:.4f}"
+                if val_ece is not None:
+                    extra += f" | ECE: {val_ece:.4f}"
+            elif val_ppl is not None:
+                extra = f" | PPL: {val_ppl:.1f}"
+                if val_tok_acc is not None:
+                    extra += f" | TokAcc: {val_tok_acc:.4f}"
+            else:
+                extra = ""
             print(
                 f"Epoch {epoch+1}/{epochs} | "
                 f"Train Loss: {avg_train_loss:.4f} | "
-                f"Val Loss: {val_loss:.4f}{acc_str}{f1_str}{ece_str}"
+                f"Val Loss: {val_loss:.4f}{extra}"
             )
 
             # ---- Save best model checkpoint (based on VALIDATION metric) ----
@@ -490,6 +526,8 @@ def train(
                         "val_accuracy": val_acc,
                         "val_f1_macro": val_f1,
                         "val_ece": val_ece,
+                        "val_perplexity": val_ppl,
+                        "val_token_accuracy": val_tok_acc,
                         "train_loss": avg_train_loss,
                         "experiment_name": experiment_name,
                         "dataset": config.get("dataset", ""),
@@ -518,7 +556,8 @@ def train(
     log.total_time = time.perf_counter() - start_time
     log.final_train_loss = avg_train_loss
     log.final_test_loss = final_test["loss"]
-    log.final_test_accuracy = final_test.get("accuracy", 0.0)
+    log.final_test_accuracy = final_test.get("accuracy",
+                                             final_test.get("token_accuracy", 0.0))
 
     # Save final model checkpoint (last epoch, NOT selected by val metric)
     final_ckpt_path = None
@@ -545,10 +584,14 @@ def train(
             "val_accuracy": final_val.get("accuracy"),
             "val_f1_macro": final_val.get("f1_macro"),
             "val_ece": final_val.get("ece"),
+            "val_perplexity": final_val.get("perplexity"),
+            "val_token_accuracy": final_val.get("token_accuracy"),
             "test_loss": final_test["loss"],
             "test_accuracy": final_test.get("accuracy"),
             "test_f1_macro": final_test.get("f1_macro"),
             "test_ece": final_test.get("ece"),
+            "test_perplexity": final_test.get("perplexity"),
+            "test_token_accuracy": final_test.get("token_accuracy"),
             "train_loss": log.final_train_loss,
             "experiment_name": experiment_name,
             "dataset": config.get("dataset", ""),
@@ -564,17 +607,24 @@ def train(
     print(f"\n{'='*70}")
     print(f"DONE: {optimizer_name} | Total time: {log.total_time:.1f}s")
     print(f"  Train Loss:     {log.final_train_loss:.4f}")
-    print(f"  Val Loss:       {final_val['loss']:.4f}" +
-          (f"  | Val Acc: {final_val.get('accuracy', 0):.4f}" if final_val.get('accuracy') else ""))
-    if final_val.get("f1_macro"):
-        print(f"  Val F1-Macro:   {final_val['f1_macro']:.4f}  | Val ECE: {final_val.get('ece', 0):.4f}")
-    print(f"  ────────────────────────────────────────────")
-    print(f"  Test Loss:      {final_test['loss']:.4f}" +
-          (f"  | Test Acc: {final_test.get('accuracy', 0):.4f}" if final_test.get('accuracy') else "") +
-          "  ← FINAL (unbiased)")
-    if final_test.get("f1_macro"):
-        print(f"  Test F1-Macro:  {final_test['f1_macro']:.4f}  | Test ECE: {final_test.get('ece', 0):.4f}")
-    print(f"  ────────────────────────────────────────────")
+
+    # Print val/test metrics (handles both classification and LM)
+    for label, metrics in [("Val", final_val), ("Test", final_test)]:
+        line = f"  {label} Loss:".ljust(18) + f"{metrics['loss']:.4f}"
+        if metrics.get("accuracy") is not None:
+            line += f"  | Acc: {metrics['accuracy']:.4f}"
+        if metrics.get("perplexity") is not None:
+            line += f"  | PPL: {metrics['perplexity']:.1f}"
+        if metrics.get("token_accuracy") is not None:
+            line += f"  | TokAcc: {metrics['token_accuracy']:.4f}"
+        if label == "Test":
+            line += "  <- FINAL (unbiased)"
+        print(line)
+        if metrics.get("f1_macro") is not None:
+            print(f"  {label} F1-Macro:".ljust(18) +
+                  f"{metrics['f1_macro']:.4f}  | ECE: {metrics.get('ece', 0):.4f}")
+
+    print(f"  --------------------------------------------------")
     print(f"  Best Val {selection_metric.title()}:  {log.best_val_loss:.4f}" if selection_metric == "loss"
           else f"  Best Val Accuracy: {log.best_val_accuracy:.4f}")
     print(f"  Peak Memory:    {get_peak_memory_mb():.1f} MB")
