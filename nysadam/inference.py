@@ -319,21 +319,25 @@ def main():
         from nysadam.utils.metrics import evaluate
 
         dataset = metadata.get("dataset", "")
-        if "cifar10" in dataset:
-            _, test_loader, _ = load_cifar("cifar10")
+        if "cifar10" in dataset and "cifar100" not in dataset:
+            _, _, test_loader, _ = load_cifar("cifar10")
         elif "cifar100" in dataset:
-            _, test_loader, _ = load_cifar("cifar100")
+            _, _, test_loader, _ = load_cifar("cifar100")
         elif "digits" in dataset:
-            _, test_loader, _ = load_sklearn_dataset("digits")
+            _, _, test_loader, _ = load_sklearn_dataset("digits")
         else:
             print(f"Cannot auto-load test data for dataset: {dataset}")
             return
 
         results = evaluate(model, test_loader, nn.CrossEntropyLoss(), device)
-        print(f"Evaluation results:")
-        print(f"  Loss:     {results['loss']:.4f}")
+        print(f"Evaluation on held-out TEST set (unbiased):")
+        print(f"  Loss:      {results['loss']:.4f}")
         if "accuracy" in results:
-            print(f"  Accuracy: {results['accuracy']:.4f}")
+            print(f"  Accuracy:  {results['accuracy']:.4f}")
+        if "f1_macro" in results:
+            print(f"  F1-Macro:  {results['f1_macro']:.4f}")
+        if "ece" in results:
+            print(f"  ECE:       {results['ece']:.4f}")
         return
 
     print("No action specified. Use --input, --evaluate, --pinn_grid, --summary, or --export_onnx")
