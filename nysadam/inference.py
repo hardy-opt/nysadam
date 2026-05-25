@@ -61,7 +61,6 @@ def load_checkpoint(checkpoint_path: str, device: Optional[torch.device] = None)
     # 2. Infer actual model class from state dict structure
     if any(k.startswith("module.") for k in state_dict.keys()):
         state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
-        checkpoint["model_state_dict"] = state_dict
 
     if model_class == "DataParallel":
         # Infer actual class from state dict keys
@@ -78,15 +77,14 @@ def load_checkpoint(checkpoint_path: str, device: Optional[torch.device] = None)
 
     # Infer model constructor args from checkpoint
     if model_class == "LogisticRegression":
-        # Infer dimensions from state dict
-        weight_key = [k for k in checkpoint["model_state_dict"] if "weight" in k][0]
-        weight_shape = checkpoint["model_state_dict"][weight_key].shape
+        weight_key = [k for k in state_dict if "weight" in k][0]
+        weight_shape = state_dict[weight_key].shape
         model_config.setdefault("num_classes", weight_shape[0])
         model_config.setdefault("input_dim", weight_shape[1])
 
     elif model_class == "ResNet":
-        linear_key = [k for k in checkpoint["model_state_dict"] if "linear.weight" in k][0]
-        num_classes = checkpoint["model_state_dict"][linear_key].shape[0]
+        linear_key = [k for k in state_dict if "linear.weight" in k][0]
+        num_classes = state_dict[linear_key].shape[0]
         model_config.setdefault("num_classes", num_classes)
 
     elif model_class == "PINN":
