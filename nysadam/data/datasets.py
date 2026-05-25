@@ -195,17 +195,27 @@ def load_cifar(
     train_set = Subset(full_train_aug, train_indices)       # Augmented
     val_set = Subset(full_train_clean, val_indices)          # Clean (no augment)
 
+    # Use persistent_workers=True to reuse worker processes across epochs
+    # instead of fork-recreating them (which leaks memory via COW page
+    # duplication). num_workers=2 is sufficient for CIFAR-10/100 and
+    # avoids memory pressure on systems with 30GB RAM.
+    n_workers = min(num_workers, 2)
+    use_persistent = n_workers > 0
+
     train_loader = DataLoader(
         train_set, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True,
+        num_workers=n_workers, pin_memory=True,
+        persistent_workers=use_persistent,
     )
     val_loader = DataLoader(
         val_set, batch_size=batch_size * 2, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
+        num_workers=n_workers, pin_memory=True,
+        persistent_workers=use_persistent,
     )
     test_loader = DataLoader(
         test_set, batch_size=batch_size * 2, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
+        num_workers=n_workers, pin_memory=True,
+        persistent_workers=use_persistent,
     )
 
     info = {
