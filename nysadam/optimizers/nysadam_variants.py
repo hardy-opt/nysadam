@@ -194,7 +194,9 @@ class NysAdamLight(Optimizer):
                                 U, S, _ = torch.linalg.svd(Q_combined, full_matrices=False)
                                 U = U[:, :m_eff]
                                 S = S[:m_eff]
-                            state["nys_Q"] = U * S.unsqueeze(0).sqrt()
+                            Q_new = U * S.unsqueeze(0).sqrt()
+                            if torch.isfinite(Q_new).all():
+                                state["nys_Q"] = Q_new
                         except Exception:
                             pass  # Keep old sketch on SVD failure
 
@@ -459,7 +461,9 @@ class NysSophia(Optimizer):
                     else:
                         U, S, _ = torch.linalg.svd(Q_combined, full_matrices=False)
                         U, S = U[:, :m], S[:m]
-                    state["nys_Q"] = U * S.unsqueeze(0).sqrt()
+                    Q_new = U * S.unsqueeze(0).sqrt()
+                    if torch.isfinite(Q_new).all():
+                        state["nys_Q"] = Q_new
                 except Exception:
                     pass
 
