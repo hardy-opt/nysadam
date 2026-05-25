@@ -312,24 +312,36 @@ def load_burgers_data(
 
 class SimpleTextDataset(Dataset):
     """
-    Simple character/token-level text dataset for LM experiments.
-    For full-scale experiments, use HuggingFace datasets instead.
+    Token-level text dataset for language model training.
+
+    Uses non-overlapping chunks of seq_len tokens, which is the standard
+    approach for LM training (GPT, GPT-2, etc.). A sliding window with
+    stride 1 would create N-seq_len samples from N tokens (massive
+    redundancy and impractical training times).
+
+    Non-overlapping: N tokens / seq_len = number of sequences.
+    For WikiText-2 (~2.4M tokens, seq_len=128): ~18,750 sequences.
     """
 
     def __init__(
         self,
         data: torch.Tensor,
-        seq_len: int = 256,
+        seq_len: int = 128,
     ):
-        self.data = data
         self.seq_len = seq_len
+        # Trim data to exact multiple of seq_len + 1 (for targets)
+        n_chunks = len(data) // (seq_len + 1)
+        self.data = data[:n_chunks * (seq_len + 1)]
+        self.n_chunks = n_chunks
 
     def __len__(self):
-        return max(0, len(self.data) - self.seq_len - 1)
+        return self.n_chunks
 
     def __getitem__(self, idx):
-        x = self.data[idx:idx + self.seq_len]
-        y = self.data[idx + 1:idx + self.seq_len + 1]
+        start = idx * (self.seq_len + 1)
+        chunk = self.data[start:start + self.seq_len + 1]
+        x = chunk[:-1]  # input tokens
+        y = chunk[1:]   # target tokens (shifted by 1)
         return x, y
 
 
