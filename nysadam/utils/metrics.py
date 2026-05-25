@@ -153,15 +153,17 @@ def evaluate(
     """
     Evaluate model on a dataset with comprehensive metrics.
 
-    Computes:
-    - Loss (cross-entropy or task-specific) — strictly proper scoring rule
-    - Accuracy (top-1)
-    - F1-Macro (robust to class imbalance)
-    - ECE (Expected Calibration Error, Guo et al. 2017)
+    For classification (outputs are [batch, num_classes]):
+    - Loss, Accuracy, F1-Macro, ECE, per-class accuracy
+
+    For language modeling (outputs are [batch, seq_len, vocab_size]):
+    - Loss, Perplexity, token-level accuracy
+    - Skips ECE/F1/per-class (not applicable, and storing [N, 50K]
+      probability vectors would exhaust CPU memory)
 
     Following Gneiting & Raftery (2007): loss is the primary metric
-    for model selection since cross-entropy is a strictly proper scoring
-    rule. Accuracy, F1, and ECE are reported for completeness.
+    for model selection since cross-entropy is a strictly proper
+    scoring rule.
 
     Args:
         model: Neural network.
@@ -171,16 +173,19 @@ def evaluate(
         num_classes: Number of classes (auto-detected if 0).
 
     Returns:
-        Dictionary with 'loss', 'accuracy', 'f1_macro', 'ece', and
-        'per_class_accuracy' (when applicable).
+        Dictionary with metrics appropriate to the task.
     """
     model.eval()
     total_loss = 0.0
     total_samples = 0
+    total_tokens = 0
+    total_correct_tokens = 0
+    is_lm = None  # Auto-detect on first batch
 
+    # Classification accumulators (only used for non-LM tasks)
     all_preds = []
     all_targets = []
-    all_probs = []  # For ECE and AUC computation
+    all_probs = []
 
     for batch in dataloader:
         if len(batch) == 2:
@@ -194,36 +199,51 @@ def evaluate(
         outputs = model(inputs)
         loss = loss_fn(outputs, targets)
 
-        total_loss += loss.item() * inputs.size(0)
-        total_samples += inputs.size(0)
+        batch_size = inputs.size(0)
+        total_loss += loss.item() * batch_size
+        total_samples += batch_size
 
-        # Classification metrics
-        if outputs.dim() > 1 and outputs.size(1) > 1:
-            probs = torch.softmax(outputs, dim=1)
-            preds = outputs.argmax(dim=1)
-            all_preds.append(preds.cpu())
-            all_targets.append(targets.cpu())
-            all_probs.append(probs.cpu())
+        # Auto-detect task type on first batch
+        if is_lm is None:
+            is_lm = (outputs.dim() == 3 and outputs.size(-1) > 1000)
+
+        if is_lm:
+            # Language model: compute token accuracy without storing probs
+            # outputs: [batch, seq_len, vocab_size]
+            # targets: [batch, seq_len]
+            token_preds = outputs.argmax(dim=-1)  # [batch, seq_len]
+            total_tokens += targets.numel()
+            total_correct_tokens += (token_preds == targets).sum().item()
+        else:
+            # Classification: accumulate for F1/ECE (small tensors)
+            if outputs.dim() > 1 and outputs.size(1) > 1:
+                probs = torch.softmax(outputs, dim=1)
+                preds = outputs.argmax(dim=1)
+                all_preds.append(preds.cpu())
+                all_targets.append(targets.cpu())
+                all_probs.append(probs.cpu())
 
     model.train()
 
     result = {"loss": total_loss / max(total_samples, 1)}
 
-    # Classification metrics
-    if all_preds:
+    if is_lm:
+        # Language model metrics
+        import math
+        result["perplexity"] = math.exp(min(result["loss"], 20))  # Cap to avoid overflow
+        result["token_accuracy"] = total_correct_tokens / max(total_tokens, 1)
+    elif all_preds:
+        # Classification metrics
         preds = torch.cat(all_preds)
         targets = torch.cat(all_targets)
         probs = torch.cat(all_probs)
 
-        # Accuracy
         correct = (preds == targets).sum().item()
         result["accuracy"] = correct / len(targets)
 
-        # F1-Macro (robust to imbalance)
         n_classes = num_classes if num_classes > 0 else probs.size(1)
         result["f1_macro"] = _compute_f1_macro(preds, targets, n_classes)
 
-        # Per-class accuracy
         per_class_acc = {}
         for c in range(n_classes):
             mask = targets == c
@@ -231,7 +251,6 @@ def evaluate(
                 per_class_acc[c] = (preds[mask] == c).float().mean().item()
         result["per_class_accuracy"] = per_class_acc
 
-        # ECE — Expected Calibration Error (Guo et al. 2017)
         result["ece"] = _compute_ece(probs, targets, n_bins=15)
 
     return result
