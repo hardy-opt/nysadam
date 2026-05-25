@@ -533,6 +533,7 @@ def train(
                         "dataset": config.get("dataset", ""),
                     }
                     torch.save(checkpoint, ckpt_path)
+                    del checkpoint  # Free ~130 MB (CPU copies of model + optimizer state)
                     metric_str = f"val_loss={val_loss:.4f}" if selection_metric == "loss" else f"val_acc={val_acc:.4f}"
                     print(f"  -> Saved best checkpoint ({metric_str})")
                 else:
@@ -598,6 +599,7 @@ def train(
             "total_training_time_sec": log.total_time,
         }
         torch.save(checkpoint, final_ckpt_path)
+        del checkpoint  # Free CPU copies of model + optimizer state
 
         best_ckpt_path = os.path.join(
             checkpoint_dir,
