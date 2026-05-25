@@ -136,10 +136,15 @@ def load_cifar(
     - 5k validation (NO augmentation, clean evaluation)
     The 10k test set is held out and touched only once.
 
+    Uses num_workers=0 (in-process loading) because CIFAR images are
+    32x32 and transforms take microseconds per batch. Multiprocessing
+    workers cause copy-on-write memory growth on Linux due to Python
+    GC modifying reference counts in forked address spaces.
+
     Args:
         dataset: 'cifar10' or 'cifar100'.
         batch_size: Batch size.
-        num_workers: Data loading workers.
+        num_workers: Ignored (kept for API compatibility). Always uses 0.
         data_dir: Download directory.
         augment: Apply data augmentation to training set.
         val_fraction: Fraction of training data for validation.
@@ -152,70 +157,61 @@ def load_cifar(
     from torch.utils.data import Subset
 
     if dataset == "cifar10":
-        Dataset = torchvision.datasets.CIFAR10
+        DatasetClass = torchvision.datasets.CIFAR10
         mean = (0.4914, 0.4822, 0.4465)
         std = (0.2023, 0.1994, 0.2010)
         num_classes = 10
     elif dataset == "cifar100":
-        Dataset = torchvision.datasets.CIFAR100
+        DatasetClass = torchvision.datasets.CIFAR100
         mean = (0.5071, 0.4867, 0.4408)
         std = (0.2675, 0.2565, 0.2761)
         num_classes = 100
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
 
-    if augment:
-        transform_train = T.Compose([
-            T.RandomCrop(32, padding=4),
-            T.RandomHorizontalFlip(),
-            T.ToTensor(),
-            T.Normalize(mean, std),
-        ])
-    else:
-        transform_train = T.Compose([T.ToTensor(), T.Normalize(mean, std)])
+    transform_train = T.Compose([
+        T.RandomCrop(32, padding=4),
+        T.RandomHorizontalFlip(),
+        T.ToTensor(),
+        T.Normalize(mean, std),
+    ]) if augment else T.Compose([T.ToTensor(), T.Normalize(mean, std)])
 
     transform_eval = T.Compose([T.ToTensor(), T.Normalize(mean, std)])
 
-    # Load full training set twice: once with augment, once without (for val)
-    full_train_aug = Dataset(data_dir, train=True, download=True, transform=transform_train)
-    full_train_clean = Dataset(data_dir, train=True, download=True, transform=transform_eval)
-    test_set = Dataset(data_dir, train=False, download=True, transform=transform_eval)
+    # Load each split exactly once (no duplicate datasets)
+    full_train = DatasetClass(data_dir, train=True, download=True, transform=transform_train)
+    test_set = DatasetClass(data_dir, train=False, download=True, transform=transform_eval)
 
-    # Stratified train/val split
-    n_total = len(full_train_aug)
+    # Deterministic train/val split
+    n_total = len(full_train)
     n_val = int(n_total * val_fraction)
-    n_train = n_total - n_val
-
-    # Use fixed random generator for reproducibility
     gen = torch.Generator().manual_seed(42)
     indices = torch.randperm(n_total, generator=gen).tolist()
-    train_indices = indices[:n_train]
-    val_indices = indices[n_train:]
+    train_indices = indices[:n_total - n_val]
+    val_indices = indices[n_total - n_val:]
 
-    train_set = Subset(full_train_aug, train_indices)       # Augmented
-    val_set = Subset(full_train_clean, val_indices)          # Clean (no augment)
+    train_set = Subset(full_train, train_indices)
 
-    # Use persistent_workers=True to reuse worker processes across epochs
-    # instead of fork-recreating them (which leaks memory via COW page
-    # duplication). num_workers=2 is sufficient for CIFAR-10/100 and
-    # avoids memory pressure on systems with 30GB RAM.
-    n_workers = min(num_workers, 2)
-    use_persistent = n_workers > 0
+    # Validation subset: wrap with a transform-overriding dataset
+    # so validation images get clean (no augment) transforms without
+    # loading the entire dataset a second time
+    val_set = _SubsetWithTransform(full_train, val_indices, transform_eval)
 
+    # num_workers=0: CIFAR images are 32x32, transforms are trivial.
+    # Workers cause copy-on-write memory growth of 500+ MB per epoch
+    # on Linux due to Python GC modifying refcounts in forked address
+    # spaces. In-process loading adds <1% overhead for CIFAR.
     train_loader = DataLoader(
         train_set, batch_size=batch_size, shuffle=True,
-        num_workers=n_workers, pin_memory=True,
-        persistent_workers=use_persistent,
+        num_workers=0, pin_memory=True,
     )
     val_loader = DataLoader(
         val_set, batch_size=batch_size * 2, shuffle=False,
-        num_workers=n_workers, pin_memory=True,
-        persistent_workers=use_persistent,
+        num_workers=0, pin_memory=True,
     )
     test_loader = DataLoader(
         test_set, batch_size=batch_size * 2, shuffle=False,
-        num_workers=n_workers, pin_memory=True,
-        persistent_workers=use_persistent,
+        num_workers=0, pin_memory=True,
     )
 
     info = {
@@ -228,6 +224,36 @@ def load_cifar(
     }
 
     return train_loader, val_loader, test_loader, info
+
+
+class _SubsetWithTransform(Dataset):
+    """
+    A subset of a dataset that overrides the transform.
+
+    This avoids loading the dataset twice (once with augmentation,
+    once without). The validation subset uses the parent dataset's
+    raw data but applies a clean (no augmentation) transform.
+    """
+
+    def __init__(self, dataset, indices, transform):
+        self.dataset = dataset
+        self.indices = indices
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        # Access the raw PIL image and target from the parent dataset
+        # CIFAR datasets store images as numpy arrays in self.data
+        # and labels in self.targets
+        real_idx = self.indices[idx]
+        from PIL import Image
+        img = Image.fromarray(self.dataset.data[real_idx])
+        target = self.dataset.targets[real_idx]
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, target
 
 
 # ═══════════════════════════════════════════════════════════════════
