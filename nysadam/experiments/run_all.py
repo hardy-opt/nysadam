@@ -805,6 +805,9 @@ def run_experiment(
     """
     Run a complete experiment comparing multiple optimizers.
 
+    Data is loaded ONCE and reused across all optimizer runs to prevent
+    memory accumulation from duplicate DataLoader worker processes.
+
     Args:
         experiment_name: Key from DEFAULT_EXPERIMENTS or custom config.
         optimizer_names: List of optimizers to run (default: all in config).
@@ -815,6 +818,8 @@ def run_experiment(
     Returns:
         Dictionary mapping optimizer names to their ExperimentLogs.
     """
+    import gc
+
     device = get_device()
 
     # Load config
@@ -829,6 +834,64 @@ def run_experiment(
     # Determine which optimizers to run
     if optimizer_names is None:
         optimizer_names = list(config["optimizers"].keys())
+
+    # ════════════════════════════════════════════════════════════════
+    # Load data ONCE outside the optimizer loop.
+    # DataLoaders with num_workers>0 create forked worker processes.
+    # Recreating them per optimizer leaks memory via copy-on-write
+    # page duplication in worker address spaces.
+    # ════════════════════════════════════════════════════════════════
+    dataset_name = config["dataset"]
+    batch_size = config.get("batch_size", 128)
+    train_loader = val_loader = test_loader = None
+    pinn_dataset = None
+    data_info = {}
+
+    if dataset_name in ("digits", "covtype", "breast_cancer", "iris", "wine", "synthetic"):
+        train_loader, val_loader, test_loader, data_info = load_sklearn_dataset(dataset_name)
+    elif dataset_name in ("cifar10", "cifar100"):
+        train_loader, val_loader, test_loader, data_info = load_cifar(
+            dataset_name, batch_size=batch_size,
+        )
+    elif dataset_name == "burgers":
+        train_loader, pinn_dataset, data_info = load_burgers_data()
+    elif dataset_name == "wikitext2":
+        seq_len = config.get("model_config", {}).get("max_seq_len", 128)
+        train_loader, val_loader, test_loader, data_info = load_text_data(
+            batch_size=batch_size,
+            seq_len=seq_len,
+        )
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+
+    # Precompute model kwargs (same for all optimizers)
+    model_name = config["model"]
+    base_model_kwargs = dict(config.get("model_config", {}))
+
+    if model_name == "logistic":
+        base_model_kwargs["input_dim"] = data_info["input_dim"]
+        base_model_kwargs["num_classes"] = data_info["num_classes"]
+    elif model_name in ("resnet18", "resnet34"):
+        base_model_kwargs["num_classes"] = data_info["num_classes"]
+    elif model_name == "pinn":
+        base_model_kwargs["input_dim"] = data_info.get("input_dim", 2)
+        base_model_kwargs["output_dim"] = data_info.get("output_dim", 1)
+    elif model_name == "transformer_lm":
+        base_model_kwargs["vocab_size"] = data_info.get("vocab_size", 50257)
+
+    # Loss function (same for all optimizers)
+    if model_name == "transformer_lm":
+        def lm_loss_fn(output, targets):
+            if output.dim() == 3:
+                return F.cross_entropy(
+                    output.view(-1, output.size(-1)), targets.view(-1)
+                )
+            return F.cross_entropy(output, targets)
+        loss_fn = lm_loss_fn
+    elif model_name == "pinn":
+        loss_fn = nn.MSELoss()
+    else:
+        loss_fn = nn.CrossEntropyLoss()
 
     results = {}
 
@@ -846,70 +909,12 @@ def run_experiment(
         opt_config = config["optimizers"][opt_name]
         merged_config = {**config, **opt_config}
 
-        # ---- Load data (3-way split: train / val / test) ----
-        dataset_name = config["dataset"]
-        batch_size = config.get("batch_size", 128)
-
-        if dataset_name in ("digits", "covtype", "breast_cancer", "iris", "wine", "synthetic"):
-            train_loader, val_loader, test_loader, data_info = load_sklearn_dataset(dataset_name)
-        elif dataset_name in ("cifar10", "cifar100"):
-            train_loader, val_loader, test_loader, data_info = load_cifar(
-                dataset_name, batch_size=batch_size,
-            )
-        elif dataset_name == "burgers":
-            train_loader, pinn_dataset, data_info = load_burgers_data()
-        elif dataset_name == "wikitext2":
-            seq_len = config.get("model_config", {}).get("max_seq_len", 128)
-            train_loader, val_loader, test_loader, data_info = load_text_data(
-                batch_size=batch_size,
-                seq_len=seq_len,
-            )
-        else:
-            raise ValueError(f"Unknown dataset: {dataset_name}")
-
-        # ---- Create model ----
-        model_name = config["model"]
-        model_kwargs = config.get("model_config", {})
-
-        if model_name == "logistic":
-            model_kwargs["input_dim"] = data_info["input_dim"]
-            model_kwargs["num_classes"] = data_info["num_classes"]
-        elif model_name in ("resnet18", "resnet34"):
-            model_kwargs["num_classes"] = data_info["num_classes"]
-        elif model_name == "pinn":
-            model_kwargs["input_dim"] = data_info.get("input_dim", 2)
-            model_kwargs["output_dim"] = data_info.get("output_dim", 1)
-        elif model_name == "transformer_lm":
-            model_kwargs["vocab_size"] = data_info.get("vocab_size", 50257)
-
-        model = create_model(model_name, **model_kwargs).to(device)
-
-        # ---- Create optimizer (BEFORE DataParallel wrapping) ----
-        # Optimizer must reference the original parameters, not
-        # DataParallel copies. DataParallel wraps model.module but
-        # the optimizer param groups point to the original tensors.
+        # ---- Create fresh model and optimizer for this run ----
+        model = create_model(model_name, **base_model_kwargs).to(device)
         optimizer = create_optimizer(opt_name, model, merged_config)
-
-        # ---- Wrap model for multi-GPU if available ----
         model, raw_model = setup_model_for_device(model, device)
 
-        # ---- Loss function ----
-        if model_name == "transformer_lm":
-            loss_fn = nn.CrossEntropyLoss()
-            # Wrap for transformer: loss expects (logits, targets)
-            def lm_loss_fn(output, targets):
-                if output.dim() == 3:
-                    return F.cross_entropy(
-                        output.view(-1, output.size(-1)), targets.view(-1)
-                    )
-                return F.cross_entropy(output, targets)
-            loss_fn = lm_loss_fn
-        elif model_name == "pinn":
-            loss_fn = nn.MSELoss()
-        else:
-            loss_fn = nn.CrossEntropyLoss()
-
-        # ---- Special handling for PINN ----
+        # ---- Train ----
         if model_name == "pinn":
             log = _train_pinn(
                 model, optimizer, opt_name, pinn_dataset,
@@ -929,6 +934,14 @@ def run_experiment(
         print(f"Results saved to {log_path}")
 
         results[opt_name] = log
+
+        # ---- Explicit cleanup between optimizer runs ----
+        # Free model and optimizer before the next run to prevent
+        # GPU memory fragmentation and reduce peak CPU memory.
+        del model, raw_model, optimizer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # Print comparison table
     _print_comparison_table(results, experiment_name)
