@@ -19,6 +19,7 @@ Usage:
 
 import os
 import sys
+import gc
 import time
 import argparse
 import yaml
@@ -51,6 +52,80 @@ from nysadam.utils.reproducibility import (
     set_seed, get_device, count_parameters,
     setup_model_for_device, get_gpu_count, print_gpu_summary,
 )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Memory hygiene helpers
+# ═══════════════════════════════════════════════════════════════════
+
+def _release_memory() -> None:
+    """
+    Aggressively reclaim Python and CUDA memory.
+
+    Under high tensor churn, CPython's generational GC defers collection
+    of objects in older generations. Force a full collection cycle and
+    flush the CUDA caching allocator. Safe to call repeatedly.
+    """
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        # ipc_collect releases inter-process CUDA handles that the driver
+        # may otherwise retain across DataParallel forward passes.
+        torch.cuda.ipc_collect()
+
+
+def _save_checkpoint_cpu(
+    raw_model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    metadata: Dict,
+    path: str,
+) -> None:
+    """
+    Save a checkpoint by streaming tensors to CPU one at a time.
+
+    A naive ``torch.save({"model_state_dict": model.state_dict(), ...})``
+    where the state dict contains GPU tensors causes pickle to copy ALL
+    tensors to CPU simultaneously before writing. For ResNet-18 with an
+    Adam-family optimizer this temporarily allocates ~130 MB on CPU per
+    save. Under cosine LR over 60 epochs, the best-checkpoint may be
+    rewritten ~30 times — accumulating multi-GB transient allocations
+    that CPython's GC fails to reclaim promptly under high allocation
+    pressure, and that PyTorch's CPU memory pool retains.
+
+    By explicitly materializing state on CPU into a single dict, then
+    immediately calling ``torch.save`` and deleting the dict, we keep
+    the lifetime of CPU copies tight and bounded.
+
+    Args:
+        raw_model: Unwrapped model (no DataParallel wrapper).
+        optimizer: Optimizer whose state will be persisted.
+        metadata: Plain-Python checkpoint metadata (no tensors).
+        path: Destination file path.
+    """
+    # Move state to CPU explicitly so torch.save doesn't create a second copy
+    model_state = {k: v.detach().cpu() for k, v in raw_model.state_dict().items()}
+    optimizer_state = _optimizer_state_to_cpu(optimizer.state_dict())
+
+    checkpoint = {**metadata, "model_state_dict": model_state,
+                  "optimizer_state_dict": optimizer_state}
+    torch.save(checkpoint, path)
+
+    # Drop references immediately and force a collection so the CPU
+    # tensor copies are returned to the allocator's free list this turn.
+    del checkpoint, model_state, optimizer_state
+    gc.collect()
+
+
+def _optimizer_state_to_cpu(state_dict: Dict) -> Dict:
+    """Recursively move tensor values inside an optimizer state_dict to CPU."""
+    if isinstance(state_dict, torch.Tensor):
+        return state_dict.detach().cpu()
+    if isinstance(state_dict, dict):
+        return {k: _optimizer_state_to_cpu(v) for k, v in state_dict.items()}
+    if isinstance(state_dict, (list, tuple)):
+        result = [_optimizer_state_to_cpu(v) for v in state_dict]
+        return type(state_dict)(result)
+    return state_dict
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -233,15 +308,8 @@ def train(
     - Override via config['selection_metric'] = 'accuracy' when
       top-1 accuracy is the sole deployment metric
 
-    Handles:
-    - Standard gradient-based optimization (Adam, SGD)
-    - Per-sample gradient computation for NysAdam/SketchySGD
-    - Hessian diagonal updates for Sophia/NysSophia
-    - Periodic evaluation on validation set
-    - Comprehensive metric logging (loss, accuracy, F1, ECE)
-
     Args:
-        model: Neural network.
+        model: Neural network (possibly DataParallel-wrapped).
         optimizer: Optimizer instance.
         optimizer_name: Name string for logging.
         train_loader: Training data loader.
@@ -269,6 +337,12 @@ def train(
     #   accuracy is the sole deployment metric + balanced classes)
     selection_metric = config.get("selection_metric", "loss")
 
+    # Unwrap DataParallel once, up front. Holding ONE reference to the raw
+    # module (as opposed to re-resolving `model.module` repeatedly) makes
+    # ownership explicit and lets us clean up deterministically at the end.
+    raw_model = model.module if hasattr(model, "module") else model
+    model_class_name = raw_model.__class__.__name__
+
     # Learning rate scheduler
     scheduler_name = config.get("scheduler", "cosine")
     total_steps = epochs * len(train_loader)
@@ -292,7 +366,7 @@ def train(
     log = ExperimentLog(
         optimizer_name=optimizer_name,
         dataset=experiment_name,
-        model=(model.module if hasattr(model, "module") else model).__class__.__name__,
+        model=model_class_name,
         config=config,
     )
 
@@ -301,10 +375,6 @@ def train(
     start_time = time.perf_counter()
     # For checkpoint selection: lower is better for loss, higher for accuracy
     best_val_metric = float("inf") if selection_metric == "loss" else 0.0
-
-    # Unwrap DataParallel for class name and raw model access
-    _raw = model.module if hasattr(model, "module") else model
-    model_class_name = _raw.__class__.__name__
 
     # Early stopping (Prechelt, 1998)
     patience = config.get("early_stopping_patience", 20)
@@ -315,34 +385,40 @@ def train(
 
     print(f"\n{'='*70}")
     print(f"Training: {experiment_name} | Optimizer: {optimizer_name}")
-    raw = model.module if hasattr(model, "module") else model
-    print(f"Model: {raw.__class__.__name__} | Params: {count_parameters(raw):,}")
+    print(f"Model: {model_class_name} | Params: {count_parameters(raw_model):,}")
     print(f"Epochs: {epochs} | Selection: min val {selection_metric}")
     print_gpu_summary()
     print(f"{'='*70}\n")
+
+    avg_train_loss = float("inf")
+    final_val: Dict = {}
+    final_test: Dict = {}
 
     for epoch in range(epochs):
         epoch_loss = 0.0
         epoch_samples = 0
 
+        # mininterval throttles tqdm refresh — without it, set_postfix on
+        # every batch generates thousands of stdout messages that Jupyter's
+        # IOPub buffer holds in RAM until the cell finishes.
         pbar = tqdm(
             train_loader, desc=f"Epoch {epoch+1}/{epochs}",
-            leave=False, dynamic_ncols=True,
+            leave=False, dynamic_ncols=True, mininterval=0.5,
         )
 
-        for batch_idx, batch in enumerate(pbar):
-            if len(batch) == 2:
-                inputs, targets = batch
-            else:
-                inputs, targets = batch[0], batch[1]
+        try:
+            for batch_idx, batch in enumerate(pbar):
+                if len(batch) == 2:
+                    inputs, targets = batch
+                else:
+                    inputs, targets = batch[0], batch[1]
 
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-            global_step += 1
+                inputs = inputs.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+                global_step += 1
 
-            # ---- Forward + backward ----
-            with Timer() as step_timer:
-                optimizer.zero_grad()
+                # ---- Forward + backward ----
+                optimizer.zero_grad(set_to_none=True)
                 output = model(inputs)
                 if hasattr(output, 'loss'):
                     loss = output.loss
@@ -350,26 +426,29 @@ def train(
                     loss = loss_fn(output, targets)
                 loss.backward()
 
-                grad_norm = compute_grad_norm(model)
+                # Gradient norm: compute only when we actually log, not
+                # every step. Each call performs a host sync per parameter
+                # which both slows training and creates short-lived
+                # allocations that fragment the CUDA caching allocator.
+                should_log = (global_step % log_every == 0)
+                grad_norm = compute_grad_norm(model) if should_log else 0.0
 
                 # ---- Optimizer-specific updates ----
 
                 # NysAdam / SketchySGD: micro-batch gradient update
                 if needs_per_sample and global_step % nys_refresh == 0:
                     try:
-                        raw = model.module if hasattr(model, "module") else model
-
                         # Save the full-batch gradient before microbatch computation.
                         # compute_nystrom_grads_microbatch calls zero_grad() and
                         # backward() internally, which would overwrite p.grad.
                         saved_grads = {
                             p: p.grad.detach().clone()
-                            for p in raw.parameters()
+                            for p in raw_model.parameters()
                             if p.grad is not None
                         }
 
                         psg = compute_nystrom_grads_microbatch(
-                            raw, loss_fn, inputs, targets,
+                            raw_model, loss_fn, inputs, targets,
                             n_microbatches=nys_n_microbatches,
                         )
                         if hasattr(optimizer, "update_nystrom_sketch"):
@@ -378,31 +457,34 @@ def train(
                         # Restore the full-batch gradient for optimizer.step()
                         for p, g in saved_grads.items():
                             p.grad = g
+
+                        # Drop intermediate tensors immediately so they
+                        # don't hang around until the next batch.
+                        del psg, saved_grads
                     except Exception:
                         pass  # Gracefully skip on failure
 
                 # Sophia / NysSophia: Hessian diagonal update
                 if needs_hessian and global_step % hessian_refresh == 0:
                     try:
-                        raw = model.module if hasattr(model, "module") else model
-
                         # Save gradients (Hessian estimation also uses backward)
                         saved_grads = {
                             p: p.grad.detach().clone()
-                            for p in raw.parameters()
+                            for p in raw_model.parameters()
                             if p.grad is not None
                         }
 
                         if hasattr(optimizer, "update_hessian"):
-                            optimizer.update_hessian(raw, loss_fn, inputs, targets)
+                            optimizer.update_hessian(raw_model, loss_fn, inputs, targets)
                         elif hasattr(optimizer, "update_hessian_diagonal"):
                             optimizer.update_hessian_diagonal(
-                                raw, loss_fn, inputs, targets,
+                                raw_model, loss_fn, inputs, targets,
                             )
 
                         # Restore gradients
                         for p, g in saved_grads.items():
                             p.grad = g
+                        del saved_grads
                     except Exception:
                         pass
 
@@ -412,39 +494,52 @@ def train(
                 if scheduler is not None:
                     scheduler.step()
 
-            epoch_loss += loss.item() * inputs.size(0)
-            epoch_samples += inputs.size(0)
+                # Accumulate epoch statistics from a host-side scalar.
+                loss_value = loss.item()
+                epoch_loss += loss_value * inputs.size(0)
+                epoch_samples += inputs.size(0)
 
-            # ---- Logging ----
-            if global_step % log_every == 0:
-                current_lr = (
-                    scheduler.get_last_lr()[0] if scheduler else
-                    optimizer.param_groups[0]["lr"]
-                )
+                # ---- Logging ----
+                if should_log:
+                    current_lr = (
+                        scheduler.get_last_lr()[0] if scheduler else
+                        optimizer.param_groups[0]["lr"]
+                    )
 
-                step_metrics = StepMetrics(
-                    step=global_step,
-                    epoch=epoch,
-                    train_loss=loss.item(),
-                    learning_rate=current_lr,
-                    grad_norm=grad_norm,
-                    update_norm=0.0,
-                    wall_time=time.perf_counter() - start_time,
-                    peak_memory_mb=get_peak_memory_mb(),
-                )
+                    step_metrics = StepMetrics(
+                        step=global_step,
+                        epoch=epoch,
+                        train_loss=loss_value,
+                        learning_rate=current_lr,
+                        grad_norm=grad_norm,
+                        update_norm=0.0,
+                        wall_time=time.perf_counter() - start_time,
+                        peak_memory_mb=get_peak_memory_mb(),
+                    )
 
-                # NysAdam diagnostics (safe against cusolver errors)
-                if hasattr(optimizer, "get_nystrom_diagnostics"):
-                    try:
-                        diag = optimizer.get_nystrom_diagnostics()
-                        step_metrics.nys_condition_number = diag.get("avg_condition_number")
-                        step_metrics.nys_effective_rank = diag.get("avg_sketch_rank")
-                    except Exception:
-                        pass
+                    # NysAdam diagnostics (safe against cusolver errors)
+                    if hasattr(optimizer, "get_nystrom_diagnostics"):
+                        try:
+                            diag = optimizer.get_nystrom_diagnostics()
+                            step_metrics.nys_condition_number = diag.get("avg_condition_number")
+                            step_metrics.nys_effective_rank = diag.get("avg_sketch_rank")
+                        except Exception:
+                            pass
 
-                log.add_step(step_metrics)
+                    log.add_step(step_metrics)
+                    pbar.set_postfix(
+                        {"loss": f"{loss_value:.4f}", "gnorm": f"{grad_norm:.3f}"}
+                    )
 
-            pbar.set_postfix({"loss": f"{loss.item():.4f}", "gnorm": f"{grad_norm:.3f}"})
+                # Drop the loss tensor (and the autograd-graph head that it
+                # roots) so it can be reclaimed before the next forward.
+                # backward() already freed activations, but the loss object
+                # itself is held by the local variable until reassignment.
+                del loss, output
+        finally:
+            # Explicit close prevents tqdm from holding the iterable
+            # reference across many epochs of an early-stopped run.
+            pbar.close()
 
         # ---- Epoch evaluation on VALIDATION set (for model selection) ----
         avg_train_loss = epoch_loss / max(epoch_samples, 1)
@@ -508,12 +603,13 @@ def train(
                         checkpoint_dir,
                         f"{experiment_name}_{optimizer_name}_best.pt",
                     )
-                    # Save raw model state (without DataParallel prefix)
-                    checkpoint = {
+                    metric_str = (
+                        f"val_loss={val_loss:.4f}" if selection_metric == "loss"
+                        else f"val_acc={val_acc:.4f}"
+                    )
+                    metadata = {
                         "epoch": epoch + 1,
                         "global_step": global_step,
-                        "model_state_dict": _raw.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
                         "model_class": model_class_name,
                         "model_config": config.get("model_config", {}),
                         "optimizer_name": optimizer_name,
@@ -532,9 +628,7 @@ def train(
                         "experiment_name": experiment_name,
                         "dataset": config.get("dataset", ""),
                     }
-                    torch.save(checkpoint, ckpt_path)
-                    del checkpoint  # Free ~130 MB (CPU copies of model + optimizer state)
-                    metric_str = f"val_loss={val_loss:.4f}" if selection_metric == "loss" else f"val_acc={val_acc:.4f}"
+                    _save_checkpoint_cpu(raw_model, optimizer, metadata, ckpt_path)
                     print(f"  -> Saved best checkpoint ({metric_str})")
                 else:
                     epochs_without_improvement += 1
@@ -568,11 +662,9 @@ def train(
             checkpoint_dir,
             f"{experiment_name}_{optimizer_name}_final.pt",
         )
-        checkpoint = {
+        final_metadata = {
             "epoch": epochs,
             "global_step": global_step,
-            "model_state_dict": _raw.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
             "model_class": model_class_name,
             "model_config": config.get("model_config", {}),
             "optimizer_name": optimizer_name,
@@ -598,8 +690,7 @@ def train(
             "dataset": config.get("dataset", ""),
             "total_training_time_sec": log.total_time,
         }
-        torch.save(checkpoint, final_ckpt_path)
-        del checkpoint  # Free CPU copies of model + optimizer state
+        _save_checkpoint_cpu(raw_model, optimizer, final_metadata, final_ckpt_path)
 
         best_ckpt_path = os.path.join(
             checkpoint_dir,
@@ -820,8 +911,6 @@ def run_experiment(
     Returns:
         Dictionary mapping optimizer names to their ExperimentLogs.
     """
-    import gc
-
     device = get_device()
 
     # Load config
@@ -895,7 +984,7 @@ def run_experiment(
     else:
         loss_fn = nn.CrossEntropyLoss()
 
-    results = {}
+    results: Dict[str, ExperimentLog] = {}
 
     for opt_name in optimizer_names:
         if opt_name not in config["optimizers"]:
@@ -916,34 +1005,52 @@ def run_experiment(
         optimizer = create_optimizer(opt_name, model, merged_config)
         model, raw_model = setup_model_for_device(model, device)
 
-        # ---- Train ----
-        if model_name == "pinn":
-            log = _train_pinn(
-                model, optimizer, opt_name, pinn_dataset,
-                merged_config, device, experiment_name,
-            )
-        else:
-            log = train(
-                model, optimizer, opt_name,
-                train_loader, val_loader, test_loader, loss_fn,
-                merged_config, device, experiment_name,
-            )
-
-        # Save results
-        os.makedirs(output_dir, exist_ok=True)
-        log_path = os.path.join(output_dir, f"{experiment_name}_{opt_name}.json")
-        log.save(log_path)
-        print(f"Results saved to {log_path}")
-
-        results[opt_name] = log
-
-        # ---- Explicit cleanup between optimizer runs ----
-        # Free model and optimizer before the next run to prevent
-        # GPU memory fragmentation and reduce peak CPU memory.
-        del model, raw_model, optimizer
-        gc.collect()
+        # Reset peak-memory counters so each optimizer reports its OWN
+        # peak rather than the watermark left behind by previous runs.
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
+        # ---- Train ----
+        try:
+            if model_name == "pinn":
+                log = _train_pinn(
+                    model, optimizer, opt_name, pinn_dataset,
+                    merged_config, device, experiment_name,
+                )
+            else:
+                log = train(
+                    model, optimizer, opt_name,
+                    train_loader, val_loader, test_loader, loss_fn,
+                    merged_config, device, experiment_name,
+                )
+        finally:
+            # ---- Save results & flush all references ----
+            # Even on exception, we must release this optimizer's state
+            # before constructing the next one — otherwise the dual
+            # allocation would push us over the 30 GB Kaggle limit.
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+                log_path = os.path.join(output_dir, f"{experiment_name}_{opt_name}.json")
+                if 'log' in dir():
+                    log.save(log_path)
+                    print(f"Results saved to {log_path}")
+                    # Keep only summary statistics in `results`; drop the
+                    # per-step list which can hold thousands of entries
+                    # across an entire suite of optimizers.
+                    log.steps = []
+                    results[opt_name] = log
+            finally:
+                # Order matters: optimizer holds references to model
+                # parameters, so it must be released first.
+                try:
+                    del optimizer
+                except UnboundLocalError:
+                    pass
+                try:
+                    del model, raw_model
+                except UnboundLocalError:
+                    pass
+                _release_memory()
 
     # Print comparison table
     _print_comparison_table(results, experiment_name)
@@ -971,17 +1078,18 @@ def _train_pinn(model, optimizer, opt_name, dataset, config, device, experiment_
     )
 
     start_time = time.perf_counter()
+    loss_value = float("nan")
 
     for epoch in range(epochs):
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss = burgers_pinn_loss(model, dataset, device)
         loss.backward()
 
-        grad_norm = compute_grad_norm(model)
+        # grad_norm and Nyström work only on logged/refresh epochs
+        should_log = (epoch + 1) % config.get("log_every", 20) == 0
+        grad_norm = compute_grad_norm(model) if should_log else 0.0
 
         # ---- Nyström sketch update for NysAdam on PINNs ----
-        # Compute per-sample gradients by evaluating loss on random
-        # subsets of collocation points (each subset = one "sample")
         if needs_per_sample and (epoch + 1) % nys_refresh == 0:
             if hasattr(optimizer, "update_nystrom_sketch"):
                 try:
@@ -989,15 +1097,18 @@ def _train_pinn(model, optimizer, opt_name, dataset, config, device, experiment_
                         model, dataset, device, n_subsets=nys_n_microbatches,
                     )
                     optimizer.update_nystrom_sketch(psg)
+                    del psg
                 except Exception:
-                    pass  # Gracefully skip on failure
+                    pass
 
         optimizer.step()
+        loss_value = loss.item()
+        del loss
 
-        if (epoch + 1) % config.get("log_every", 20) == 0:
+        if should_log:
             step_metrics = StepMetrics(
                 step=epoch + 1, epoch=epoch,
-                train_loss=loss.item(),
+                train_loss=loss_value,
                 learning_rate=optimizer.param_groups[0]["lr"],
                 grad_norm=grad_norm, update_norm=0.0,
                 wall_time=time.perf_counter() - start_time,
@@ -1005,12 +1116,12 @@ def _train_pinn(model, optimizer, opt_name, dataset, config, device, experiment_
             log.add_step(step_metrics)
 
         if (epoch + 1) % config.get("eval_every", 10) == 0:
-            print(f"Epoch {epoch+1}/{epochs} | PDE Loss: {loss.item():.6f} | "
+            print(f"Epoch {epoch+1}/{epochs} | PDE Loss: {loss_value:.6f} | "
                   f"Grad Norm: {grad_norm:.4f}")
 
     log.total_time = time.perf_counter() - start_time
-    log.final_train_loss = loss.item()
-    log.final_test_loss = loss.item()
+    log.final_train_loss = loss_value
+    log.final_test_loss = loss_value
     return log
 
 
