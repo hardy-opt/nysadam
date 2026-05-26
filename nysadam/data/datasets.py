@@ -127,6 +127,7 @@ def load_cifar(
     data_dir: str = "./data",
     augment: bool = True,
     val_fraction: float = 0.1,
+    pin_memory: Optional[bool] = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader, dict]:
     """
     Load CIFAR-10 or CIFAR-100 with proper train/val/test split.
@@ -141,6 +142,15 @@ def load_cifar(
     workers cause copy-on-write memory growth on Linux due to Python
     GC modifying reference counts in forked address spaces.
 
+    pin_memory defaults to False on hosts with constrained CPU RAM
+    (e.g. Kaggle's 30 GB limit shared with the dataset). Pinned host
+    pages are never released back to the OS by PyTorch's allocator and
+    accumulate as the CUDA driver creates staging buffers for transfers,
+    which we observed pushing process RSS past the limit during
+    multi-optimizer comparison runs. With non_blocking=True transfers
+    from regular pageable memory still overlap forward/backward
+    reasonably well on a single-GPU setup.
+
     Args:
         dataset: 'cifar10' or 'cifar100'.
         batch_size: Batch size.
@@ -148,6 +158,8 @@ def load_cifar(
         data_dir: Download directory.
         augment: Apply data augmentation to training set.
         val_fraction: Fraction of training data for validation.
+        pin_memory: Whether to pin host memory. Defaults to False to keep
+            CPU RAM usage predictable on memory-constrained hosts.
 
     Returns:
         (train_loader, val_loader, test_loader, info_dict)
@@ -155,6 +167,9 @@ def load_cifar(
     import torchvision
     import torchvision.transforms as T
     from torch.utils.data import Subset
+
+    if pin_memory is None:
+        pin_memory = False
 
     if dataset == "cifar10":
         DatasetClass = torchvision.datasets.CIFAR10
@@ -203,15 +218,15 @@ def load_cifar(
     # spaces. In-process loading adds <1% overhead for CIFAR.
     train_loader = DataLoader(
         train_set, batch_size=batch_size, shuffle=True,
-        num_workers=0, pin_memory=True,
+        num_workers=0, pin_memory=pin_memory,
     )
     val_loader = DataLoader(
         val_set, batch_size=batch_size * 2, shuffle=False,
-        num_workers=0, pin_memory=True,
+        num_workers=0, pin_memory=pin_memory,
     )
     test_loader = DataLoader(
         test_set, batch_size=batch_size * 2, shuffle=False,
-        num_workers=0, pin_memory=True,
+        num_workers=0, pin_memory=pin_memory,
     )
 
     info = {
