@@ -119,20 +119,32 @@ class Timer:
 
 
 def compute_grad_norm(model: torch.nn.Module) -> float:
-    """Compute total gradient L2 norm across all parameters."""
-    total_norm_sq = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            total_norm_sq += p.grad.data.norm(2).item() ** 2
-    return total_norm_sq ** 0.5
+    """
+    Compute total gradient L2 norm across all parameters.
+
+    Uses a single fused norm over all gradients on each device to avoid
+    issuing one host sync per parameter. For ResNet-18 (~60 leaf params)
+    this collapses 60 syncs into 1 per call.
+    """
+    grads = [p.grad.detach() for p in model.parameters() if p.grad is not None]
+    if not grads:
+        return 0.0
+    # Stack on the device the grads live on. torch.norm of a vector
+    # of norms equals the L2 norm of the concatenation.
+    device = grads[0].device
+    norms = torch.stack(
+        [torch.linalg.vector_norm(g, ord=2) for g in grads]
+    )
+    return torch.linalg.vector_norm(norms, ord=2).item()
 
 
 def compute_param_norm(model: torch.nn.Module) -> float:
     """Compute total parameter L2 norm."""
-    total = 0.0
-    for p in model.parameters():
-        total += p.data.norm(2).item() ** 2
-    return total ** 0.5
+    params = [p.detach() for p in model.parameters()]
+    if not params:
+        return 0.0
+    norms = torch.stack([torch.linalg.vector_norm(p, ord=2) for p in params])
+    return torch.linalg.vector_norm(norms, ord=2).item()
 
 
 def get_peak_memory_mb() -> float:
@@ -165,6 +177,11 @@ def evaluate(
     for model selection since cross-entropy is a strictly proper
     scoring rule.
 
+    Memory note: F1 and ECE are computed on streaming confusion-matrix /
+    bin counts rather than by concatenating all per-batch predictions.
+    For CIFAR-100 over 10k samples this saves ~4 MB peak per eval; for
+    LM vocabularies it saves orders of magnitude more.
+
     Args:
         model: Neural network.
         dataloader: Evaluation data loader.
@@ -180,12 +197,16 @@ def evaluate(
     total_samples = 0
     total_tokens = 0
     total_correct_tokens = 0
-    is_lm = None  # Auto-detect on first batch
+    is_lm: Optional[bool] = None  # Auto-detect on first batch
 
-    # Classification accumulators (only used for non-LM tasks)
-    all_preds = []
-    all_targets = []
-    all_probs = []
+    # Streaming classification accumulators (constant memory in N samples).
+    # Allocated lazily once num_classes is known.
+    confusion: Optional[torch.Tensor] = None  # [C, C], rows=true, cols=pred
+    ece_bins = 15
+    ece_bin_conf_sum: Optional[torch.Tensor] = None  # [bins]
+    ece_bin_correct_sum: Optional[torch.Tensor] = None  # [bins]
+    ece_bin_count: Optional[torch.Tensor] = None  # [bins]
+    ece_boundaries: Optional[torch.Tensor] = None
 
     for batch in dataloader:
         if len(batch) == 2:
@@ -193,8 +214,8 @@ def evaluate(
         else:
             inputs, targets = batch[0], batch[1]
 
-        inputs = inputs.to(device)
-        targets = targets.to(device)
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
 
         outputs = model(inputs)
         loss = loss_fn(outputs, targets)
@@ -208,118 +229,137 @@ def evaluate(
             is_lm = (outputs.dim() == 3 and outputs.size(-1) > 1000)
 
         if is_lm:
-            # Language model: compute token accuracy without storing probs
-            # outputs: [batch, seq_len, vocab_size]
-            # targets: [batch, seq_len]
+            # Language model: streaming token accuracy
             token_preds = outputs.argmax(dim=-1)  # [batch, seq_len]
             total_tokens += targets.numel()
             total_correct_tokens += (token_preds == targets).sum().item()
-        else:
-            # Classification: accumulate for F1/ECE (small tensors)
-            if outputs.dim() > 1 and outputs.size(1) > 1:
-                probs = torch.softmax(outputs, dim=1)
-                preds = outputs.argmax(dim=1)
-                all_preds.append(preds.cpu())
-                all_targets.append(targets.cpu())
-                all_probs.append(probs.cpu())
+        elif outputs.dim() > 1 and outputs.size(1) > 1:
+            # Classification: streaming confusion matrix + ECE bin sums.
+            # No per-batch tensors are retained; each batch contributes
+            # to running totals and is then released.
+            probs = torch.softmax(outputs, dim=1)
+            confidences, preds = probs.max(dim=1)
+
+            C = probs.size(1) if num_classes <= 0 else num_classes
+            if confusion is None:
+                confusion = torch.zeros(C, C, dtype=torch.long, device=device)
+                ece_bin_conf_sum = torch.zeros(ece_bins, device=device)
+                ece_bin_correct_sum = torch.zeros(ece_bins, device=device)
+                ece_bin_count = torch.zeros(ece_bins, dtype=torch.long, device=device)
+                ece_boundaries = torch.linspace(0, 1, ece_bins + 1, device=device)
+
+            # Accumulate confusion matrix via flat-index scatter_add.
+            flat = targets * C + preds
+            confusion.view(-1).scatter_add_(
+                0, flat, torch.ones_like(flat, dtype=torch.long)
+            )
+
+            # ECE bins: index into [0, ece_bins-1] from confidence
+            bin_idx = torch.bucketize(confidences, ece_boundaries[1:-1])
+            correct = (preds == targets).float()
+            ece_bin_conf_sum.scatter_add_(0, bin_idx, confidences)
+            ece_bin_correct_sum.scatter_add_(0, bin_idx, correct)
+            ece_bin_count.scatter_add_(
+                0, bin_idx, torch.ones_like(bin_idx, dtype=torch.long)
+            )
+
+        # Drop per-batch tensors before next iteration so the autograd
+        # graph and large logit tensors are reclaimed promptly.
+        del outputs, loss
 
     model.train()
 
-    result = {"loss": total_loss / max(total_samples, 1)}
+    result: Dict[str, float] = {"loss": total_loss / max(total_samples, 1)}
 
     if is_lm:
-        # Language model metrics
         import math
-        result["perplexity"] = math.exp(min(result["loss"], 20))  # Cap to avoid overflow
+        result["perplexity"] = math.exp(min(result["loss"], 20))
         result["token_accuracy"] = total_correct_tokens / max(total_tokens, 1)
-    elif all_preds:
-        # Classification metrics
-        preds = torch.cat(all_preds)
-        targets = torch.cat(all_targets)
-        probs = torch.cat(all_probs)
+    elif confusion is not None:
+        confusion_cpu = confusion.cpu()
+        C = confusion_cpu.size(0)
+        n_total = int(confusion_cpu.sum().item())
 
-        correct = (preds == targets).sum().item()
-        result["accuracy"] = correct / len(targets)
+        correct = int(confusion_cpu.diag().sum().item())
+        result["accuracy"] = correct / max(n_total, 1)
+        result["f1_macro"] = _f1_macro_from_confusion(confusion_cpu)
 
-        n_classes = num_classes if num_classes > 0 else probs.size(1)
-        result["f1_macro"] = _compute_f1_macro(preds, targets, n_classes)
-
-        per_class_acc = {}
-        for c in range(n_classes):
-            mask = targets == c
-            if mask.sum() > 0:
-                per_class_acc[c] = (preds[mask] == c).float().mean().item()
+        per_class_acc: Dict[int, float] = {}
+        row_totals = confusion_cpu.sum(dim=1)
+        for c in range(C):
+            if row_totals[c].item() > 0:
+                per_class_acc[c] = (
+                    confusion_cpu[c, c].item() / row_totals[c].item()
+                )
         result["per_class_accuracy"] = per_class_acc
 
-        result["ece"] = _compute_ece(probs, targets, n_bins=15)
+        result["ece"] = _ece_from_bins(
+            ece_bin_conf_sum.cpu(),
+            ece_bin_correct_sum.cpu(),
+            ece_bin_count.cpu(),
+        )
 
     return result
 
 
-def _compute_f1_macro(
-    preds: torch.Tensor,
-    targets: torch.Tensor,
-    n_classes: int,
+def _f1_macro_from_confusion(confusion: torch.Tensor) -> float:
+    """
+    Compute macro-averaged F1 from a confusion matrix.
+
+    F1-Macro averages F1 across all classes equally, making it robust
+    to class imbalance unlike accuracy which is dominated by the
+    majority class.
+
+    Args:
+        confusion: [C, C] confusion matrix (rows=true, cols=predicted).
+
+    Returns:
+        Macro F1 averaged over classes that appear in the targets.
+    """
+    eps = 1e-8
+    tp = confusion.diag().float()
+    fp = confusion.sum(dim=0).float() - tp
+    fn = confusion.sum(dim=1).float() - tp
+
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    f1 = 2 * precision * recall / (precision + recall + eps)
+
+    # Only average over classes that exist in the targets
+    present = confusion.sum(dim=1) > 0
+    if not present.any():
+        return 0.0
+    return f1[present].mean().item()
+
+
+def _ece_from_bins(
+    conf_sum: torch.Tensor,
+    correct_sum: torch.Tensor,
+    counts: torch.Tensor,
 ) -> float:
     """
-    Compute macro-averaged F1 score.
-
-    F1-Macro averages F1 across all classes equally, making it
-    robust to class imbalance — unlike accuracy which is dominated
-    by the majority class.
-    """
-    f1_scores = []
-    for c in range(n_classes):
-        tp = ((preds == c) & (targets == c)).sum().float()
-        fp = ((preds == c) & (targets != c)).sum().float()
-        fn = ((preds != c) & (targets == c)).sum().float()
-
-        precision = tp / (tp + fp + 1e-8)
-        recall = tp / (tp + fn + 1e-8)
-        f1 = 2 * precision * recall / (precision + recall + 1e-8)
-
-        # Only include classes that exist in the targets
-        if (targets == c).sum() > 0:
-            f1_scores.append(f1.item())
-
-    return sum(f1_scores) / max(len(f1_scores), 1)
-
-
-def _compute_ece(
-    probs: torch.Tensor,
-    targets: torch.Tensor,
-    n_bins: int = 15,
-) -> float:
-    """
-    Compute Expected Calibration Error (Guo et al. 2017).
+    Compute Expected Calibration Error from streaming bin accumulators.
 
     ECE measures how well predicted probabilities match actual
     correctness frequencies. A well-calibrated model has ECE ≈ 0.
 
-    A model selected at minimum validation loss tends to have lower ECE
-    than one selected at maximum accuracy, because loss penalizes
-    overconfident miscalibrated predictions while accuracy does not.
-
     Args:
-        probs: Predicted probabilities [N, C].
-        targets: True labels [N].
-        n_bins: Number of confidence bins.
+        conf_sum: Sum of confidences per bin [n_bins].
+        correct_sum: Sum of correct predictions per bin [n_bins].
+        counts: Number of samples per bin [n_bins].
 
     Returns:
         ECE value (lower is better, 0 = perfectly calibrated).
     """
-    confidences, predictions = probs.max(dim=1)
-    accuracies = predictions.eq(targets).float()
+    total = counts.sum().item()
+    if total == 0:
+        return 0.0
 
     ece = 0.0
-    bin_boundaries = torch.linspace(0, 1, n_bins + 1)
-
-    for i in range(n_bins):
-        in_bin = (confidences > bin_boundaries[i]) & (confidences <= bin_boundaries[i + 1])
-        n_in_bin = in_bin.sum().item()
-        if n_in_bin > 0:
-            avg_confidence = confidences[in_bin].mean().item()
-            avg_accuracy = accuracies[in_bin].mean().item()
-            ece += (n_in_bin / len(targets)) * abs(avg_accuracy - avg_confidence)
-
+    for i in range(counts.numel()):
+        n = counts[i].item()
+        if n > 0:
+            avg_conf = conf_sum[i].item() / n
+            avg_acc = correct_sum[i].item() / n
+            ece += (n / total) * abs(avg_acc - avg_conf)
     return ece
