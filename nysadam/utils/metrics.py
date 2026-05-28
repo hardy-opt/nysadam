@@ -154,7 +154,7 @@ def get_peak_memory_mb() -> float:
     return 0.0
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def evaluate(
     model: torch.nn.Module,
     dataloader,
