@@ -123,8 +123,16 @@ class NysAdamLight(Optimizer):
                     state["exp_avg"] = torch.zeros_like(p)
                     state["exp_avg_sq"] = torch.zeros_like(p)
 
-                    # Gradient buffer for sketch construction
-                    use_nys = (nys_rank > 0) and (d >= min_dim)
+                    # Gradient buffer for sketch construction.
+                    # Memory guard: for large parameters (e.g. vocab embeddings
+                    # with d=12.8M), the buffer alone would be buf_size*d*4 bytes
+                    # = 6.4 GB. Skip Nystrom for such layers — they are better
+                    # handled by Adam's diagonal anyway, and NysAdamLight's
+                    # gradient-history sketch provides less benefit on very
+                    # high-dimensional embedding spaces.
+                    buffer_bytes = buf_size * d * p.element_size()
+                    max_buffer_bytes = 256 * 1024 * 1024  # 256 MB per parameter
+                    use_nys = (nys_rank > 0) and (d >= min_dim) and (buffer_bytes <= max_buffer_bytes)
                     state["use_nystrom"] = use_nys
 
                     if use_nys:
