@@ -101,7 +101,7 @@ def _epoch_gc() -> None:
     script, which is negligible relative to the epoch time (~30s for
     CIFAR-10 ResNet-18).
 
-    We intentionally do NOT call torch.cuda.empty_cache() here — it forces
+    We intentionally do NOT call torch.cuda.empty_cache() here -- it forces
     a cudaDeviceSynchronize and costs 5-6% throughput per the HuggingFace
     Transformers benchmark (GH #31372). It is reserved for between-run
     cleanup in _release_memory().
@@ -675,11 +675,10 @@ def train(
                 break
 
         # ---- Per-epoch memory reclamation ----
-        # nn.DataParallel creates reference cycles (autograd nodes,
-        # replicated tensors, thread-local state) on every forward pass.
+        # nn.DataParallel creates reference cycles on every forward pass.
         # CPython's cyclic GC defers gen-2 collection, so these cycles
         # accumulate unless we explicitly collect. Without this call,
-        # memory grows ~200 MB/epoch on 2×T4 with ResNet-18.
+        # memory grows ~200 MB/epoch on 2xT4 with ResNet-18.
         _epoch_gc()
 
     # ════════════════════════════════════════════════════════════════
@@ -1162,7 +1161,7 @@ def _train_pinn(model, optimizer, opt_name, dataset, config, device, experiment_
             print(f"Epoch {epoch+1}/{epochs} | PDE Loss: {loss_value:.6f} | "
                   f"Grad Norm: {grad_norm:.4f}")
 
-        # Periodic GC (every 50 PINN epochs ≈ every ~3s)
+        # Periodic GC (every 50 PINN epochs)
         if (epoch + 1) % 50 == 0:
             _epoch_gc()
 
