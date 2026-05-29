@@ -406,7 +406,11 @@ def load_text_data(
     Load text data for language modeling experiments.
 
     WikiText-2 natively provides train/validation/test splits.
-    For synthetic fallback, we create a 3-way split from random data.
+    Tokenization is done per-line to avoid triggering the HuggingFace
+    tokenizer warning about exceeding model_max_length (the tokenizer
+    warns when a single encode() call exceeds GPT-2's 1024-token limit,
+    even though our SimpleTextDataset chunks the result into seq_len
+    blocks afterward).
 
     Returns:
         (train_loader, val_loader, test_loader, info_dict)
@@ -418,13 +422,17 @@ def load_text_data(
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
         ds = load_dataset("wikitext", "wikitext-2-raw-v1")
 
-        train_text = "\n".join(ds["train"]["text"])
-        val_text = "\n".join(ds["validation"]["text"])
-        test_text = "\n".join(ds["test"]["text"])
+        def _tokenize_split(split_texts):
+            """Tokenize per-line and concatenate to avoid length warning."""
+            all_ids = []
+            for line in split_texts:
+                if line.strip():  # skip empty lines
+                    all_ids.extend(tokenizer.encode(line))
+            return torch.tensor(all_ids, dtype=torch.long)
 
-        train_tokens = torch.tensor(tokenizer.encode(train_text), dtype=torch.long)
-        val_tokens = torch.tensor(tokenizer.encode(val_text), dtype=torch.long)
-        test_tokens = torch.tensor(tokenizer.encode(test_text), dtype=torch.long)
+        train_tokens = _tokenize_split(ds["train"]["text"])
+        val_tokens = _tokenize_split(ds["validation"]["text"])
+        test_tokens = _tokenize_split(ds["test"]["text"])
 
         vocab_size = tokenizer.vocab_size
 
